@@ -17,14 +17,17 @@
 		"nodejs_compat"
 	],
 	/**
-	 * Smart Placement - routes requests closer to MongoDB/Telegram APIs
-	 * https://developers.cloudflare.com/workers/configuration/smart-placement/#smart-placement
-	 */
-	"placement": { "mode": "smart" }
+     * Smart Placement - routes requests closer to MongoDB/Telegram APIs
+     * https://developers.cloudflare.com/workers/configuration/smart-placement/#smart-placement
+     */
+	"placement": {
+		"mode": "smart"
+	},
+	"keep_vars": true
 	/**
-	 * Environment Variables (secrets)
-	 * Set via: wrangler secret put <KEY>
-	 * Required secrets: MONGO_URI, GALLERY_USER, GALLERY_PASS, JWT_SECRET, BOT_TOKEN
-	 * Optional secrets: TURNSTILE_SECRET_KEY
-	 */
+     * Environment Variables (secrets)
+     * Set via: wrangler secret put <KEY>
+     * Required secrets: MONGO_URI, GALLERY_USER, GALLERY_PASS, JWT_SECRET, BOT_TOKEN
+     * Optional secrets: TURNSTILE_SECRET_KEY
+     */
 }
