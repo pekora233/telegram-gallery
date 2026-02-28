@@ -851,197 +851,239 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <div class="gallery-page">
-    <!-- 导航栏 -->
-    <nav class="navbar">
-          <div class="container">
-        <h1 class="navbar-brand">图床</h1>
-        <div class="navbar-actions">
-          <button @click="forceRefreshAll" class="btn btn-outline-secondary btn-sm">
-            <span>🔄</span> 刷新全部
-          </button>
-          <button
-            @click="clearImageCache"
-            class="btn btn-outline-secondary btn-sm"
-            title="清除图片缓存并重新加载"
-          >
-            清缓存
-          </button>
-          <button
-            v-if="!batchMode"
-            @click="toggleBatchMode"
-            class="btn btn-outline-secondary btn-sm"
-            title="开启批量删除模式"
-          >
-            批量删除
-          </button>
-          <button
-            v-else
-            @click="toggleSelectAllEntries"
-            class="btn btn-outline-secondary btn-sm"
-            :title="allEntriesSelected ? '取消全选' : '全选当前图片'"
-          >
-            {{ allEntriesSelected ? '取消全选' : '全选' }}
-          </button>
-          <button
-            v-if="batchMode"
-            @click="clearBatchSelection"
-            class="btn btn-outline-secondary btn-sm"
-            title="清空当前选择"
-          >
-            清空选择
-          </button>
-          <button
-            v-if="batchMode"
-            @click="performBatchDelete"
-            class="btn btn-danger btn-sm"
-            :disabled="selectedCount === 0"
-            title="删除选中的图片"
-          >
-            删除选中({{ selectedCount }})
-          </button>
-          <button
-            v-if="batchMode"
-            @click="toggleBatchMode"
-            class="btn btn-outline-secondary btn-sm"
-            title="退出批量删除模式"
-          >
-            退出批量
-          </button>
-          <button
-            v-if="toggleTheme"
-            @click="toggleTheme()"
-            class="btn btn-outline-secondary btn-sm"
-            :title="theme === 'light' ? '切换到深色模式' : '切换到亮色模式'"
-          >
-            {{ theme === 'light' ? '🌙' : '☀️' }}
-          </button>
-
-          <button
-            v-if="selectedIndex >= 0"
-            @click="refreshSingleImage(entries[selectedIndex])"
-            class="btn btn-outline-secondary btn-sm"
-            title="刷新当前图片"
-          >
-            🔄 当前
-          </button>
-
-          <button @click="logout" class="btn btn-outline-secondary btn-sm">登出</button>
+  <div class="gallery-container">
+    <!-- 顶部导航栏 -->
+    <header class="top-header">
+      <div class="header-content">
+        <div class="header-left">
+          <h1 class="header-title">Gallery</h1>
+          <div class="header-stats" v-if="entries.length > 0">
+            <span class="stats-count">{{ entries.length }}</span>
+            <span class="stats-label">images</span>
           </div>
+        </div>
+        
+        <div class="header-right">
+          <!-- 批量模式控制 -->
+          <template v-if="batchMode">
+            <button @click="toggleSelectAllEntries" class="header-btn" :title="allEntriesSelected ? '取消全选' : '全选所有图片'">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M9 11l3 3L22 4"/>
+                <path d="M21 12v7a2 2 0 01-2 2H5a2 2 0 01-2-2V5a2 2 0 012-2h11"/>
+              </svg>
+              <span>{{ allEntriesSelected ? '取消' : '全选' }}</span>
+            </button>
+            <button @click="performBatchDelete" class="header-btn danger" :disabled="selectedCount === 0" :title="`删除选中的 ${selectedCount} 张图片`">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <polyline points="3 6 5 6 21 6"/>
+                <path d="M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6m3 0V4a2 2 0 012-2h4a2 2 0 012 2v2"/>
+              </svg>
+              <span>删除 ({{ selectedCount }})</span>
+            </button>
+            <button @click="toggleBatchMode" class="header-btn" title="退出批量模式">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <line x1="18" y1="6" x2="6" y2="18"/>
+                <line x1="6" y1="6" x2="18" y2="18"/>
+              </svg>
+            </button>
+          </template>
+          
+          <!-- 普通模式控制 -->
+          <template v-else>
+            <button @click="forceRefreshAll" class="header-btn" title="刷新全部图片">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <polyline points="23 4 23 10 17 10"/>
+                <path d="M20.49 15a9 9 0 11-2.12-9.36L23 10"/>
+              </svg>
+            </button>
+            <button @click="clearImageCache" class="header-btn" title="清除图片缓存">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <polyline points="3 6 5 6 21 6"/>
+                <path d="M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6m3 0V4a2 2 0 012-2h4a2 2 0 012 2v2"/>
+                <line x1="10" y1="11" x2="10" y2="17"/>
+                <line x1="14" y1="11" x2="14" y2="17"/>
+              </svg>
+            </button>
+            <button @click="toggleBatchMode" class="header-btn" title="批量删除模式">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M9 11l3 3L22 4"/>
+                <path d="M21 12v7a2 2 0 01-2 2H5a2 2 0 01-2-2V5a2 2 0 012-2h11"/>
+              </svg>
+            </button>
+            <div class="header-divider"></div>
+            <button v-if="toggleTheme" @click="toggleTheme()" class="header-btn" :title="theme === 'light' ? '切换深色模式' : '切换亮色模式'">
+              <svg v-if="theme === 'light'" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z"/>
+              </svg>
+              <svg v-else width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <circle cx="12" cy="12" r="5"/>
+                <line x1="12" y1="1" x2="12" y2="3"/>
+                <line x1="12" y1="21" x2="12" y2="23"/>
+                <line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/>
+                <line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/>
+                <line x1="1" y1="12" x2="3" y2="12"/>
+                <line x1="21" y1="12" x2="23" y2="12"/>
+                <line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/>
+                <line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/>
+              </svg>
+            </button>
+            <button @click="logout" class="header-btn" title="登出">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M9 21H5a2 2 0 01-2-2V5a2 2 0 012-2h4"/>
+                <polyline points="16 17 21 12 16 7"/>
+                <line x1="21" y1="12" x2="9" y2="12"/>
+              </svg>
+            </button>
+          </template>
+        </div>
       </div>
-    </nav>
+    </header>
 
-      <!-- 删除确认模态 -->
-      <div v-if="showDeleteModal" class="modal-backdrop" @click.self="cancelDelete">
-        <div class="modal-card">
-          <div class="modal-header">
-            <h3>确认删除</h3>
-          </div>
-          <div class="modal-body">
-            <p>确定要删除这张图片吗？此操作不可恢复。</p>
-            <p v-if="pendingDelete?.prompt" class="muted small">{{ pendingDelete.prompt }}</p>
-          </div>
-          <div class="modal-actions">
-            <button class="btn btn-secondary" @click="cancelDelete">取消</button>
-            <button class="btn btn-danger" @click="performDelete">删除</button>
+    <!-- 删除确认模态 -->
+    <transition name="modal-fade">
+      <div v-if="showDeleteModal" class="modal-overlay" @click.self="cancelDelete">
+        <div class="modal-dialog">
+          <div class="modal-content">
+            <div class="modal-icon danger">
+              <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <circle cx="12" cy="12" r="10"/>
+                <line x1="15" y1="9" x2="9" y2="15"/>
+                <line x1="9" y1="9" x2="15" y2="15"/>
+              </svg>
+            </div>
+            <h3 class="modal-title">确认删除</h3>
+            <p class="modal-desc">确定要删除这张图片吗？此操作不可恢复。</p>
+            <p v-if="pendingDelete?.prompt" class="modal-prompt">{{ pendingDelete.prompt }}</p>
+            <div class="modal-buttons">
+              <button class="modal-btn secondary" @click="cancelDelete">取消</button>
+              <button class="modal-btn danger" @click="performDelete">删除</button>
+            </div>
           </div>
         </div>
       </div>
+    </transition>
 
-      <!-- 顶部短提示 (toast) -->
-      <div v-if="showToast" class="top-toast">{{ toastMessage }}</div>
+    <!-- Toast 通知 -->
+    <transition name="toast-slide">
+      <div v-if="showToast" class="toast-notification">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+          <polyline points="20 6 9 17 4 12"/>
+        </svg>
+        <span>{{ toastMessage }}</span>
+      </div>
+    </transition>
 
-    <div class="container">
+    <!-- 主内容区域 -->
+    <main class="main-content">
       <!-- 加载状态 -->
-      <div v-if="loading" class="text-center py-5">
-        <div class="spinner"></div>
-        <p class="mt-3">加载中...</p>
+      <div v-if="loading" class="loading-state">
+        <div class="loading-spinner"></div>
+        <p class="loading-text">加载中...</p>
       </div>
 
       <!-- 错误提示 -->
-      <div v-if="error" class="alert alert-danger">{{ error }}</div>
-
-      <!-- 统计信息 -->
-      <div v-if="entries.length > 0" class="stats">
-        已加载 {{ entries.length }} 张图片
+      <div v-if="error" class="error-message">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <circle cx="12" cy="12" r="10"/>
+          <line x1="15" y1="9" x2="9" y2="15"/>
+          <line x1="9" y1="9" x2="15" y2="15"/>
+        </svg>
+        <span>{{ error }}</span>
       </div>
-      <div v-if="batchMode" class="batch-tip">
-        已选择 {{ selectedCount }} 张，点击图片可选择/取消选择
+
+      <!-- 批量模式提示 -->
+      <div v-if="batchMode" class="batch-mode-banner">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M9 11l3 3L22 4"/>
+          <path d="M21 12v7a2 2 0 01-2 2H5a2 2 0 01-2-2V5a2 2 0 012-2h11"/>
+        </svg>
+        <span>已选择 <strong>{{ selectedCount }}</strong> 张图片，点击图片可选择/取消选择</span>
       </div>
 
-      <!-- 瀑布流网格（左右优先） -->
-      <div class="masonry-grid" v-if="!loading">
+      <!-- 瀑布流网格 -->
+      <div class="gallery-grid" v-if="!loading">
         <div
           v-for="(column, colIndex) in columns"
           :key="colIndex"
-          class="masonry-column"
+          class="grid-column"
         >
           <div
             v-for="entry in column"
             :key="entry.id"
-            class="masonry-item card"
-            :class="{ 'is-selected': batchMode && isEntrySelected(entry.id) }"
+            :class="['image-card', { 'selected': batchMode && isEntrySelected(entry.id) }]"
             @click="batchMode ? toggleEntrySelection(entry.id) : open(entry)"
           >
-            <!-- 图片容器 -->
-            <div class="image-container">
+            <!-- 图片区域 -->
+            <div class="card-image-wrapper">
+              <!-- 选择按钮 -->
               <button
                 v-if="batchMode"
-                class="select-btn"
-                :class="{ selected: isEntrySelected(entry.id) }"
+                :class="['select-checkbox', { 'checked': isEntrySelected(entry.id) }]"
                 @click.stop="toggleEntrySelection(entry.id)"
-                :title="isEntrySelected(entry.id) ? '取消选择' : '选择该图片'"
+                :title="isEntrySelected(entry.id) ? '取消选择' : '选择图片'"
               >
-                {{ isEntrySelected(entry.id) ? '✓' : '' }}
+                <svg v-if="isEntrySelected(entry.id)" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3">
+                  <polyline points="20 6 9 17 4 12"/>
+                </svg>
               </button>
+              
+              <!-- 图片 -->
               <img
                 v-if="entry.src"
                 :src="entry.src"
                 :alt="entry.prompt"
-                class="card-img-top"
+                class="card-image"
+                loading="lazy"
               />
-              <div v-else class="image-placeholder">
-                <div class="mini-spinner"></div>
+              <div v-else class="card-placeholder">
+                <div class="placeholder-spinner"></div>
               </div>
 
-              <!-- 删除按钮 -->
-              <button
-                class="refresh-btn"
-                @click.stop="openDeleteModal(entry)"
-                title="删除此图片"
-              >
-                🗑️
-              </button>
+              <!-- 操作按钮组 -->
+              <div class="card-actions">
+                <button
+                  class="action-btn delete"
+                  @click.stop="openDeleteModal(entry)"
+                  title="删除"
+                >
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <polyline points="3 6 5 6 21 6"/>
+                    <path d="M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6m3 0V4a2 2 0 012-2h4a2 2 0 012 2v2"/>
+                  </svg>
+                </button>
+              </div>
             </div>
 
-            <!-- Tags -->
-            <div class="card-body">
-              <div class="tags">
-                <span
-                  v-for="(tag, idx) in parseTags(entry.prompt).slice(0, 5)"
-                  :key="idx"
-                  class="badge badge-colored"
-                  :style="{
-                    backgroundColor: getTagColor(tag).bg,
-                    color: getTagColor(tag).text,
-                    borderColor: getTagColor(tag).border
-                  }"
-                >
-                  {{ tag }}
-                </span>
-                <span v-if="parseTags(entry.prompt).length > 5" class="badge badge-secondary">
-                  +{{ parseTags(entry.prompt).length - 5 }}
-                </span>
-              </div>
+            <!-- 标签区域 -->
+            <div class="card-tags">
+              <span
+                v-for="(tag, idx) in parseTags(entry.prompt).slice(0, 5)"
+                :key="idx"
+                class="tag"
+                :style="{
+                  backgroundColor: getTagColor(tag).bg,
+                  color: getTagColor(tag).text,
+                  borderColor: getTagColor(tag).border
+                }"
+              >
+                {{ tag }}
+              </span>
+              <span v-if="parseTags(entry.prompt).length > 5" class="tag-more">
+                +{{ parseTags(entry.prompt).length - 5 }}
+              </span>
             </div>
           </div>
         </div>
       </div>
 
+      <!-- 加载更多状态 -->
       <div v-if="!loading && entries.length > 0" class="load-more-status">
-        <span v-if="loadingMore">正在加载更多图片...</span>
-        <span v-else-if="hasMore">下滑自动加载更多图片</span>
-        <span v-else>已加载全部图片</span>
+        <div v-if="loadingMore" class="status-loading">
+          <div class="mini-spinner"></div>
+          <span>加载更多...</span>
+        </div>
+        <span v-else-if="hasMore" class="status-hint">下滑自动加载更多</span>
+        <span v-else class="status-end">— 已加载全部 —</span>
       </div>
 
       <div
@@ -1052,10 +1094,15 @@ onUnmounted(() => {
       ></div>
 
       <!-- 空状态 -->
-      <div v-if="!loading && entries.length === 0" class="text-center py-5">
-        <p class="text-muted">暂无图片</p>
+      <div v-if="!loading && entries.length === 0" class="empty-state">
+        <svg width="64" height="64" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+          <rect x="3" y="3" width="18" height="18" rx="2" ry="2"/>
+          <circle cx="8.5" cy="8.5" r="1.5"/>
+          <polyline points="21 15 16 10 5 21"/>
+        </svg>
+        <p class="empty-text">暂无图片</p>
       </div>
-    </div>
+    </main>
 
     <!-- 详情弹窗 -->
     <ImageDetail
@@ -1073,108 +1120,597 @@ onUnmounted(() => {
 </template>
 
 <style scoped>
-.gallery-page {
+/* ========== 基础容器 ========== */
+.gallery-container {
   min-height: 100vh;
-  padding-bottom: 2rem;
+  background: var(--bg-primary);
 }
 
-.navbar {
-  background-color: var(--bg-secondary);
+/* ========== 顶部导航栏 ========== */
+.top-header {
+  position: sticky;
+  top: 0;
+  z-index: 100;
+  background: var(--bg-secondary);
+  backdrop-filter: blur(20px);
   border-bottom: 1px solid var(--border-color);
-  padding: 1rem 0;
-  margin-bottom: 1.5rem;
 }
 
-.navbar .container {
-  max-width: 1400px;
+.header-content {
+  max-width: 1600px;
   margin: 0 auto;
-  padding: 0 1rem;
+  padding: 0.875rem 1.25rem;
   display: flex;
   justify-content: space-between;
   align-items: center;
+  gap: 1rem;
 }
 
-.navbar-brand {
-  font-size: 1.25rem;
-  font-weight: 600;
-  margin: 0;
-}
-
-.navbar-actions {
+.header-left {
   display: flex;
+  align-items: center;
+  gap: 1rem;
+}
+
+.header-title {
+  font-size: 1.25rem;
+  font-weight: 700;
+  margin: 0;
+  color: var(--text-primary);
+  letter-spacing: -0.02em;
+}
+
+.header-stats {
+  display: flex;
+  align-items: baseline;
+  gap: 0.375rem;
+  padding: 0.25rem 0.75rem;
+  background: var(--bg-tertiary);
+  border-radius: 0.5rem;
+  font-size: 0.813rem;
+}
+
+.stats-count {
+  font-weight: 700;
+  color: var(--primary);
+}
+
+.stats-label {
+  color: var(--text-muted);
+  font-weight: 500;
+}
+
+.header-right {
+  display: flex;
+  align-items: center;
   gap: 0.5rem;
 }
 
-.container {
-  max-width: 1400px;
-  margin: 0 auto;
-  padding: 0 1rem;
+.header-divider {
+  width: 1px;
+  height: 1.5rem;
+  background: var(--border-color);
 }
 
-.btn-sm {
-  padding: 0.25rem 0.5rem;
+.header-btn {
+  display: flex;
+  align-items: center;
+  gap: 0.375rem;
+  padding: 0.5rem 0.75rem;
+  border: none;
+  background: transparent;
+  color: var(--text-secondary);
+  border-radius: 0.5rem;
   font-size: 0.875rem;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+  white-space: nowrap;
 }
 
-.spinner {
+.header-btn:hover {
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
+}
+
+.header-btn:active {
+  transform: scale(0.95);
+}
+
+.header-btn.danger {
+  color: #ef4444;
+}
+
+.header-btn.danger:hover {
+  background: rgba(239, 68, 68, 0.1);
+  color: #dc2626;
+}
+
+.header-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+  transform: none;
+}
+
+.header-btn svg {
+  flex-shrink: 0;
+}
+
+/* ========== 模态框 ========== */
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.6);
+  backdrop-filter: blur(4px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 2000;
+  padding: 1rem;
+}
+
+.modal-dialog {
+  width: 100%;
+  max-width: 400px;
+}
+
+.modal-content {
+  background: var(--bg-secondary);
+  border-radius: 1rem;
+  padding: 1.5rem;
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+  border: 1px solid var(--border-color);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  gap: 1rem;
+}
+
+.modal-icon {
   width: 3rem;
   height: 3rem;
-  border: 0.25rem solid var(--border-color);
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.modal-icon.danger {
+  background: rgba(239, 68, 68, 0.1);
+  color: #ef4444;
+}
+
+.modal-title {
+  font-size: 1.125rem;
+  font-weight: 700;
+  margin: 0;
+  color: var(--text-primary);
+}
+
+.modal-desc {
+  font-size: 0.875rem;
+  color: var(--text-secondary);
+  margin: 0;
+  line-height: 1.5;
+}
+
+.modal-prompt {
+  font-size: 0.813rem;
+  color: var(--text-muted);
+  margin: 0;
+  padding: 0.5rem 0.75rem;
+  background: var(--bg-tertiary);
+  border-radius: 0.5rem;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.modal-buttons {
+  display: flex;
+  gap: 0.625rem;
+  width: 100%;
+  margin-top: 0.5rem;
+}
+
+.modal-btn {
+  flex: 1;
+  padding: 0.75rem 1rem;
+  border: none;
+  border-radius: 0.625rem;
+  font-size: 0.875rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.modal-btn.secondary {
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
+}
+
+.modal-btn.secondary:hover {
+  background: var(--bg-primary);
+}
+
+.modal-btn.danger {
+  background: #ef4444;
+  color: white;
+}
+
+.modal-btn.danger:hover {
+  background: #dc2626;
+}
+
+.modal-btn:active {
+  transform: scale(0.95);
+}
+
+.modal-fade-enter-active,
+.modal-fade-leave-active {
+  transition: opacity 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.modal-fade-enter-active .modal-content,
+.modal-fade-leave-active .modal-content {
+  transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.modal-fade-enter-from,
+.modal-fade-leave-to {
+  opacity: 0;
+}
+
+.modal-fade-enter-from .modal-content {
+  transform: scale(0.95);
+}
+
+.modal-fade-leave-to .modal-content {
+  transform: scale(0.95);
+}
+
+/* ========== Toast 通知 ========== */
+.toast-notification {
+  position: fixed;
+  top: 5rem;
+  left: 50%;
+  transform: translateX(-50%);
+  background: rgba(16, 185, 129, 0.95);
+  backdrop-filter: blur(10px);
+  color: white;
+  padding: 0.75rem 1.25rem;
+  border-radius: 0.75rem;
+  font-weight: 600;
+  font-size: 0.875rem;
+  box-shadow: 0 8px 16px rgba(16, 185, 129, 0.3);
+  z-index: 2100;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.toast-slide-enter-active {
+  animation: slideDown 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.toast-slide-leave-active {
+  animation: slideUp 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+@keyframes slideDown {
+  from {
+    opacity: 0;
+    transform: translateX(-50%) translateY(-20px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(-50%) translateY(0);
+  }
+}
+
+@keyframes slideUp {
+  to {
+    opacity: 0;
+    transform: translateX(-50%) translateY(-10px);
+  }
+}
+
+/* ========== 主内容区域 ========== */
+.main-content {
+  max-width: 1600px;
+  margin: 0 auto;
+  padding: 1.5rem 1.25rem 3rem;
+}
+
+/* 加载状态 */
+.loading-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 5rem 1rem;
+  gap: 1rem;
+}
+
+.loading-spinner {
+  width: 3rem;
+  height: 3rem;
+  border: 3px solid var(--border-color);
   border-top-color: var(--primary);
   border-radius: 50%;
   animation: spin 0.8s linear infinite;
-  margin: 0 auto;
 }
 
 @keyframes spin {
   to { transform: rotate(360deg); }
 }
 
-.mini-spinner {
+.loading-text {
+  color: var(--text-secondary);
+  font-size: 0.875rem;
+  margin: 0;
+}
+
+/* 错误提示 */
+.error-message {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 1rem 1.25rem;
+  background: rgba(239, 68, 68, 0.1);
+  border: 1px solid rgba(239, 68, 68, 0.2);
+  border-radius: 0.75rem;
+  color: #ef4444;
+  font-size: 0.875rem;
+  margin-bottom: 1.5rem;
+}
+
+.error-message svg {
+  flex-shrink: 0;
+}
+
+/* 批量模式横幅 */
+.batch-mode-banner {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 0.875rem 1.25rem;
+  background: rgba(99, 102, 241, 0.1);
+  border: 1px solid rgba(99, 102, 241, 0.2);
+  border-radius: 0.75rem;
+  color: var(--primary);
+  font-size: 0.875rem;
+  margin-bottom: 1.5rem;
+}
+
+.batch-mode-banner svg {
+  flex-shrink: 0;
+}
+
+.batch-mode-banner strong {
+  font-weight: 700;
+}
+
+/* ========== 瀑布流网格 ========== */
+.gallery-grid {
+  display: flex;
+  gap: 1rem;
+}
+
+.grid-column {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+  min-width: 0;
+}
+
+/* 图片卡片 */
+.image-card {
+  background: var(--bg-secondary);
+  border-radius: 0.75rem;
+  overflow: hidden;
+  border: 1px solid var(--border-color);
+  cursor: pointer;
+  transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.image-card:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.12);
+  border-color: var(--primary);
+}
+
+.image-card.selected {
+  border-color: var(--primary);
+  box-shadow: 0 0 0 2px var(--primary), 0 8px 24px rgba(0, 0, 0, 0.12);
+}
+
+/* 图片区域 */
+.card-image-wrapper {
+  position: relative;
+  background: var(--bg-tertiary);
+  overflow: hidden;
+}
+
+.card-image {
+  width: 100%;
+  height: auto;
+  display: block;
+  transition: transform 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.image-card:hover .card-image {
+  transform: scale(1.02);
+}
+
+.card-placeholder {
+  width: 100%;
+  aspect-ratio: 3 / 4;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--bg-tertiary);
+}
+
+.placeholder-spinner {
   width: 2rem;
   height: 2rem;
-  border: 0.2rem solid var(--border-color);
+  border: 2px solid var(--border-color);
   border-top-color: var(--primary);
   border-radius: 50%;
   animation: spin 0.8s linear infinite;
 }
 
-.alert {
-  padding: 0.75rem 1.25rem;
-  margin-bottom: 1rem;
-  border: 1px solid transparent;
-  border-radius: 0.25rem;
+/* 选择框 */
+.select-checkbox {
+  position: absolute;
+  top: 0.625rem;
+  left: 0.625rem;
+  width: 1.75rem;
+  height: 1.75rem;
+  border: 2px solid rgba(255, 255, 255, 0.8);
+  border-radius: 0.375rem;
+  background: rgba(0, 0, 0, 0.4);
+  backdrop-filter: blur(4px);
+  color: white;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+  z-index: 2;
 }
 
-.alert-danger {
-  color: #842029;
-  background-color: #f8d7da;
-  border-color: #f5c2c7;
+.select-checkbox:hover {
+  background: rgba(0, 0, 0, 0.6);
+  border-color: white;
+  transform: scale(1.1);
 }
 
-[data-theme="dark"] .alert-danger {
-  color: #ea868f;
-  background-color: #2c0b0e;
-  border-color: #842029;
+.select-checkbox.checked {
+  background: var(--primary);
+  border-color: var(--primary);
 }
 
-.stats {
-  margin-bottom: 1rem;
-  color: var(--text-secondary);
-  font-size: 0.875rem;
+.select-checkbox.checked:hover {
+  background: var(--primary-hover);
+  border-color: var(--primary-hover);
 }
 
-.batch-tip {
-  margin-bottom: 1rem;
-  color: var(--text-secondary);
-  font-size: 0.875rem;
+/* 操作按钮组 */
+.card-actions {
+  position: absolute;
+  top: 0.625rem;
+  right: 0.625rem;
+  display: flex;
+  gap: 0.5rem;
+  opacity: 0;
+  transition: opacity 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+  z-index: 2;
 }
 
+.image-card:hover .card-actions {
+  opacity: 1;
+}
+
+.action-btn {
+  width: 2rem;
+  height: 2rem;
+  border: none;
+  border-radius: 0.375rem;
+  background: rgba(0, 0, 0, 0.4);
+  backdrop-filter: blur(4px);
+  color: white;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.action-btn:hover {
+  background: rgba(0, 0, 0, 0.6);
+  transform: scale(1.1);
+}
+
+.action-btn.delete:hover {
+  background: #ef4444;
+}
+
+.action-btn svg {
+  flex-shrink: 0;
+}
+
+/* 标签区域 */
+.card-tags {
+  padding: 0.75rem;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.375rem;
+  align-items: center;
+}
+
+.tag {
+  display: inline-block;
+  padding: 0.25rem 0.5rem;
+  font-size: 0.75rem;
+  font-weight: 600;
+  line-height: 1.2;
+  border-radius: 0.375rem;
+  border: 1.5px solid;
+  transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.tag:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+}
+
+.tag-more {
+  display: inline-block;
+  padding: 0.25rem 0.5rem;
+  font-size: 0.75rem;
+  font-weight: 600;
+  line-height: 1.2;
+  border-radius: 0.375rem;
+  background: var(--text-muted);
+  color: var(--bg-primary);
+}
+
+/* ========== 加载更多状态 ========== */
 .load-more-status {
-  margin: 1.25rem 0 0.75rem;
+  margin-top: 2rem;
   text-align: center;
   color: var(--text-secondary);
   font-size: 0.875rem;
+}
+
+.status-loading {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.75rem;
+}
+
+.mini-spinner {
+  width: 1.25rem;
+  height: 1.25rem;
+  border: 2px solid var(--border-color);
+  border-top-color: var(--primary);
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+
+.status-hint {
+  color: var(--text-muted);
+}
+
+.status-end {
+  color: var(--text-muted);
+  font-weight: 500;
 }
 
 .load-more-anchor {
@@ -1182,207 +1718,76 @@ onUnmounted(() => {
   height: 1px;
 }
 
-.masonry-grid {
-  display: flex;
-  gap: 1rem;
-}
-
-.masonry-column {
-  flex: 1;
+/* ========== 空状态 ========== */
+.empty-state {
   display: flex;
   flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 5rem 1rem;
   gap: 1rem;
 }
 
-.masonry-item {
-  cursor: pointer;
-  transition: transform 0.2s, box-shadow 0.2s;
-}
-
-.masonry-item:hover {
-  transform: translateY(-2px);
-  box-shadow: var(--shadow-lg);
-}
-
-.masonry-item.is-selected {
-  box-shadow: 0 0 0 2px var(--primary), var(--shadow-lg);
-}
-
-.image-container {
-  position: relative;
-  background: var(--bg-tertiary);
-}
-
-.card-img-top {
-  width: 100%;
-  height: auto;
-  display: block;
-}
-
-.image-placeholder {
-  width: 100%;
-  aspect-ratio: 3/4;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-}
-
-.select-btn {
-  position: absolute;
-  top: 0.5rem;
-  left: 0.5rem;
-  width: 2rem;
-  height: 2rem;
-  border: 1px solid var(--border-color);
-  border-radius: 999px;
-  background: var(--bg-secondary);
-  color: var(--text-primary);
-  cursor: pointer;
-  font-size: 0.875rem;
-  font-weight: 700;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  z-index: 2;
-}
-
-.select-btn.selected {
-  background: var(--primary);
-  border-color: var(--primary);
-  color: #fff;
-}
-
-.refresh-btn {
-  position: absolute;
-  top: 0.5rem;
-  right: 0.5rem;
-  width: 2rem;
-  height: 2rem;
-  border: 1px solid var(--border-color);
-  border-radius: 0.25rem;
-  background: var(--bg-secondary);
-  opacity: 0;
-  transition: opacity 0.2s;
-  cursor: pointer;
-  font-size: 0.875rem;
-  padding: 0;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-}
-
-.masonry-item:hover .refresh-btn {
-  opacity: 1;
-}
-
-.refresh-btn:hover {
-  background: var(--bg-tertiary);
-}
-
-.modal-backdrop {
-  position: fixed;
-  inset: 0;
-  background: rgba(10,10,10,0.5);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  z-index: 2000;
-}
-.modal-card {
-  width: 90%;
-  max-width: 520px;
-  background: var(--bg-primary);
-  border-radius: 12px;
-  box-shadow: 0 20px 60px rgba(2,6,23,0.6);
-  overflow: hidden;
-  border: 1px solid var(--border-color);
-}
-.modal-header {
-  padding: 1rem 1.25rem;
-  border-bottom: 1px solid var(--border-color);
-}
-.modal-header h3 { margin: 0; }
-.modal-body { padding: 1rem 1.25rem; color: var(--text-primary); }
-.modal-actions { padding: 0.75rem 1.25rem; display:flex; gap:0.5rem; justify-content:flex-end; }
-.btn-danger { background: #ef4444; color: white; border: none; padding: 0.6rem 1rem; border-radius: 8px; cursor: pointer; }
-.btn-danger:disabled { opacity: 0.5; cursor: not-allowed; }
-.btn-secondary { background: var(--bg-secondary); color: var(--text-primary); border: 1px solid var(--border-color); padding: 0.5rem 0.9rem; border-radius: 8px; cursor: pointer; }
-
-.top-toast {
-  position: fixed;
-  top: 1rem;
-  left: 50%;
-  transform: translateX(-50%);
-  background: linear-gradient(90deg,var(--primary),var(--primary-hover));
-  color: white;
-  padding: 0.6rem 1rem;
-  border-radius: 999px;
-  z-index: 2100;
-  box-shadow: 0 8px 30px rgba(0,0,0,0.35);
-}
-
-.card-body {
-  padding: 0.75rem;
-}
-
-.tags {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 0.25rem;
-}
-
-.badge {
-  display: inline-block;
-  padding: 0.25rem 0.5rem;
-  font-size: 0.75rem;
-  font-weight: 500;
-  line-height: 1;
-  background-color: var(--bg-tertiary);
-  color: var(--text-primary);
-  border-radius: 0.25rem;
-}
-
-.badge-colored {
-  border: 1.5px solid;
-  font-weight: 600;
-  transition: transform 0.2s, box-shadow 0.2s;
-}
-
-.badge-colored:hover {
-  transform: translateY(-1px);
-  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
-}
-
-.badge-secondary {
-  background-color: var(--text-muted);
-  color: var(--bg-primary);
-}
-
-.text-center {
-  text-align: center;
-}
-
-.py-5 {
-  padding-top: 3rem;
-  padding-bottom: 3rem;
-}
-
-.mt-3 {
-  margin-top: 1rem;
-}
-
-.text-muted {
+.empty-state svg {
   color: var(--text-muted);
+  opacity: 0.5;
+}
+
+.empty-text {
+  color: var(--text-secondary);
+  font-size: 0.875rem;
+  margin: 0;
+}
+
+/* ========== 响应式设计 ========== */
+@media (max-width: 1024px) {
+  .header-content {
+    padding: 0.75rem 1rem;
+  }
+  
+  .header-title {
+    font-size: 1.125rem;
+  }
+  
+  .main-content {
+    padding: 1.25rem 1rem 2.5rem;
+  }
 }
 
 @media (max-width: 768px) {
-  .navbar-actions {
-    flex-direction: column;
-    gap: 0.25rem;
+  .header-btn span {
+    display: none;
   }
+  
+  .header-btn {
+    padding: 0.5rem;
+  }
+  
+  .header-stats {
+    display: none;
+  }
+  
+  .gallery-grid {
+    gap: 0.75rem;
+  }
+  
+  .grid-column {
+    gap: 0.75rem;
+  }
+}
 
-  .btn-sm {
-    width: 100%;
+@media (max-width: 640px) {
+  .header-right {
+    gap: 0.375rem;
+  }
+  
+  .main-content {
+    padding: 1rem 0.75rem 2rem;
+  }
+  
+  .batch-mode-banner {
+    font-size: 0.813rem;
+    padding: 0.75rem 1rem;
   }
 }
 </style>
