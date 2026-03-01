@@ -21,6 +21,18 @@ const PHOTOSWIPE_AUTO_LOAD_THRESHOLD = 5;
 
 const currentEntry = computed(() => props.entries[props.currentIndex]);
 
+function getDisplayFileId(entry) {
+  return entry?.telegram?.file_id_lossy || entry?.telegram?.file_id || null;
+}
+
+const canDownloadOriginal = computed(() => Boolean(currentEntry.value?.telegram?.file_id));
+
+function getOriginalDownloadUrl() {
+  const fileId = currentEntry.value?.telegram?.file_id;
+  if (!fileId) return '';
+  return `/api/file/${encodeURIComponent(fileId)}/image?t=${Date.now()}`;
+}
+
 const metaLines = computed(() => {
   const m = currentEntry.value?.metadata || {};
   const lines = [];
@@ -111,9 +123,59 @@ function copyAllInfo() {
   copyToClipboard(allInfo.join('\n'), '全部信息');
 }
 
+const isDownloading = ref(false);
+
+async function downloadOriginalImage() {
+  if (!canDownloadOriginal.value || isDownloading.value) return;
+  isDownloading.value = true;
+  try {
+    const url = getOriginalDownloadUrl();
+    if (!url) return;
+    const resp = await fetch(url);
+    if (!resp.ok) throw new Error('Download failed');
+
+    // Try to get filename from Content-Disposition header
+    const disposition = resp.headers.get('content-disposition') || '';
+    const filenameMatch = disposition.match(/filename="?([^";\s]+)"?/);
+    let filename = filenameMatch ? filenameMatch[1] : null;
+
+    if (!filename) {
+      const contentType = resp.headers.get('content-type') || 'image/png';
+      const extMap = {
+        'image/png': 'png',
+        'image/jpeg': 'jpg',
+        'image/webp': 'webp',
+        'image/gif': 'gif',
+        'image/avif': 'avif',
+        'image/jxl': 'jxl',
+        'image/bmp': 'bmp',
+      };
+      const base = contentType.split(';')[0].trim().toLowerCase();
+      const ext = extMap[base] || 'png';
+      const entryId = currentEntry.value?.id || Date.now();
+      filename = `image-${entryId}.${ext}`;
+    }
+
+    const blob = await resp.blob();
+    const blobUrl = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = blobUrl;
+    link.download = filename;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(blobUrl);
+  } catch (err) {
+    console.error('Download failed:', err);
+  } finally {
+    isDownloading.value = false;
+  }
+}
+
 function toPhotoSwipeItem(entry) {
-  const fallbackSrc = entry?.telegram?.file_id
-    ? `/api/fileurl?file_id=${encodeURIComponent(entry.telegram.file_id)}`
+  const displayFileId = getDisplayFileId(entry);
+  const fallbackSrc = displayFileId
+    ? `/api/file/${encodeURIComponent(displayFileId)}/image`
     : '';
   return {
     src: entry?.src || fallbackSrc,
@@ -418,13 +480,26 @@ onUnmounted(() => {
           </div>
 
           <!-- 快速操作 -->
-          <div class="quick-actions" v-if="props.onRefresh">
-            <button @click="props.onRefresh" class="quick-action-btn">
+          <div class="quick-actions" v-if="props.onRefresh || canDownloadOriginal">
+            <button v-if="props.onRefresh" @click="props.onRefresh" class="quick-action-btn">
               <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                 <polyline points="23 4 23 10 17 10"/>
                 <path d="M20.49 15a9 9 0 11-2.12-9.36L23 10"/>
               </svg>
               <span>刷新图片</span>
+            </button>
+            <button
+              v-if="canDownloadOriginal"
+              @click="downloadOriginalImage"
+              class="quick-action-btn download"
+              :disabled="isDownloading"
+            >
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+                <polyline points="7 10 12 15 17 10"/>
+                <line x1="12" y1="15" x2="12" y2="3"/>
+              </svg>
+              <span>{{ isDownloading ? 'Downloading...' : 'Download Original' }}</span>
             </button>
           </div>
         </div>
@@ -982,6 +1057,11 @@ onUnmounted(() => {
 }
 
 /* ========== 响应式设计 ========== */
+.quick-action-btn.download:hover {
+  background: #0ea5e9;
+  border-color: #0ea5e9;
+}
+
 @media (max-width: 1024px) {
   .main-content {
     flex-direction: column;

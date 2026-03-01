@@ -102,6 +102,21 @@ function buildUrlFromFilePath(botToken, filePath, useProxy = false) {
   return `${TELEGRAM_OFFICIAL}/file/bot${botToken}/${filePath}`;
 }
 
+function extFromContentType(contentType) {
+  const map = {
+    'image/png': 'png',
+    'image/jpeg': 'jpg',
+    'image/webp': 'webp',
+    'image/gif': 'gif',
+    'image/avif': 'avif',
+    'image/jxl': 'jxl',
+    'image/bmp': 'bmp',
+    'image/svg+xml': 'svg',
+  };
+  const base = (contentType || '').split(';')[0].trim().toLowerCase();
+  return map[base] || 'bin';
+}
+
 // ========== MongoDB helper ==========
 
 async function withMongo(mongoUri, fn) {
@@ -225,6 +240,7 @@ async function handleGallery(request, env) {
       telegram: {
         chat_id: d.telegram?.chat_id || null,
         file_id: d.telegram?.file_id || null,
+        file_id_lossy: d.telegram?.file_id_lossy || null,
       },
       timestamp: d.timestamp,
     });
@@ -289,6 +305,7 @@ async function handleFileUrl(request, env) {
 
   const MONGO_URI = env.MONGO_URI;
   let botToken = env.BOT_TOKEN || null;
+  let docId = null;
 
   if (MONGO_URI) {
     try {
@@ -297,9 +314,17 @@ async function handleFileUrl(request, env) {
         await client.connect();
         const db = client.db('magic_plugin_db');
         const collection = db.collection('gallery');
-        const doc = await collection.findOne({ 'telegram.file_id': file_id });
-        if (doc && doc.telegram && doc.telegram.bot_token) {
-          botToken = doc.telegram.bot_token;
+        const doc = await collection.findOne({
+          $or: [
+            { 'telegram.file_id': file_id },
+            { 'telegram.file_id_lossy': file_id },
+          ],
+        });
+        if (doc) {
+          if (doc.telegram && doc.telegram.bot_token) {
+            botToken = doc.telegram.bot_token;
+          }
+          docId = doc._id.toString();
         }
       } finally {
         await client.close();
@@ -313,6 +338,25 @@ async function handleFileUrl(request, env) {
     return jsonResponse({ error: 'No bot token available' }, 500);
   }
 
+  function buildImageResponse(imageResp, filePath) {
+    const contentType = imageResp.headers.get('content-type') || 'application/octet-stream';
+    // Prefer extension from Telegram's file_path (e.g. "photos/file_1.png", "documents/file_2.jxl")
+    const pathExt = filePath && filePath.includes('.') ? filePath.split('.').pop().toLowerCase() : null;
+    const ctExt = extFromContentType(contentType);
+    const ext = (ctExt !== 'bin') ? ctExt : (pathExt || 'bin');
+    const filenameBase = docId || file_id.slice(0, 16);
+    const filename = `${filenameBase}.${ext}`;
+    return new Response(imageResp.body, {
+      status: 200,
+      headers: {
+        'Content-Type': contentType,
+        'Content-Disposition': `inline; filename="${filename}"`,
+        'Cache-Control': 'public, max-age=31536000, immutable',
+        ...corsHeaders(),
+      },
+    });
+  }
+
   // Try official getFile
   try {
     const resp = await fetch(`${TELEGRAM_OFFICIAL}/bot${botToken}/getFile?file_id=${encodeURIComponent(file_id)}`);
@@ -323,15 +367,7 @@ async function handleFileUrl(request, env) {
 
       const imageResp = await fetch(urlDirect);
       if (imageResp.ok) {
-        const contentType = imageResp.headers.get('content-type') || 'image/jpeg';
-        return new Response(imageResp.body, {
-          status: 200,
-          headers: {
-            'Content-Type': contentType,
-            'Cache-Control': 'public, max-age=31536000, immutable',
-            ...corsHeaders(),
-          },
-        });
+        return buildImageResponse(imageResp, filePath);
       }
     }
   } catch (e) {
@@ -348,15 +384,7 @@ async function handleFileUrl(request, env) {
 
       const imageResp = await fetch(urlDirect);
       if (imageResp.ok) {
-        const contentType = imageResp.headers.get('content-type') || 'image/jpeg';
-        return new Response(imageResp.body, {
-          status: 200,
-          headers: {
-            'Content-Type': contentType,
-            'Cache-Control': 'public, max-age=31536000, immutable',
-            ...corsHeaders(),
-          },
-        });
+        return buildImageResponse(imageResp, filePath);
       }
     }
   } catch (e) {
@@ -389,6 +417,16 @@ export default {
     }
     if (url.pathname === '/api/fileurl') {
       return handleFileUrl(request, env);
+    }
+    // /api/file/<file_id>/<filename> — browser-friendly URL with proper filename
+    if (url.pathname.startsWith('/api/file/')) {
+      const segments = url.pathname.slice('/api/file/'.length).split('/');
+      const fileId = decodeURIComponent(segments[0] || '');
+      if (fileId) {
+        url.searchParams.set('file_id', fileId);
+        const newReq = new Request(url.toString(), request);
+        return handleFileUrl(newReq, env);
+      }
     }
     if (url.pathname.startsWith('/api/')) {
       return jsonResponse({ error: 'Not Found' }, 404);

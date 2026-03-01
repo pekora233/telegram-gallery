@@ -230,12 +230,15 @@ function setImageCache(fileId, url) {
 }
 
 function buildFileUrl(fileId, withCacheBust = false) {
-  const params = new URLSearchParams();
-  params.set('file_id', fileId);
+  const base = `/api/file/${encodeURIComponent(fileId)}/image`;
   if (withCacheBust) {
-    params.set('t', String(Date.now()));
+    return `${base}?t=${Date.now()}`;
   }
-  return `/api/fileurl?${params.toString()}`;
+  return base;
+}
+
+function getDisplayFileId(entry) {
+  return entry?.telegram?.file_id_lossy || entry?.telegram?.file_id || null;
 }
 
 function getGalleryListCache() {
@@ -262,11 +265,20 @@ function removeEntryFromLocalCache(entry) {
   setGalleryListCache(cached.filter((item) => item.id !== entry.id));
 
   try {
-    const fileId = entry.telegram?.file_id;
-    if (!fileId) return;
     const imageCache = getImageCache();
-    if (imageCache[fileId]) {
-      delete imageCache[fileId];
+    const fileIds = [
+      entry?.displayFileId,
+      entry?.telegram?.file_id_lossy,
+      entry?.telegram?.file_id,
+    ].filter(Boolean);
+
+    fileIds.forEach((fileId) => {
+      if (imageCache[fileId]) {
+        delete imageCache[fileId];
+      }
+    });
+
+    if (fileIds.length > 0) {
       persistImageCache(imageCache);
     }
   } catch (e) {
@@ -337,24 +349,28 @@ async function requestDeleteById(entryId) {
 }
 
 function buildEntryWithCache(entry, existingEntry, imageCache, forceImageRefresh = false) {
-  const fileId = entry.telegram?.file_id;
-  const cachedData = fileId && imageCache[fileId];
-  const keepExistingSrc = Boolean(existingEntry?.src) && !forceImageRefresh;
+  const displayFileId = getDisplayFileId(entry);
+  const cachedData = displayFileId && imageCache[displayFileId];
+  const keepExistingSrc =
+    Boolean(existingEntry?.src) &&
+    !forceImageRefresh &&
+    existingEntry?.displayFileId === displayFileId;
 
   let loadingState = false;
   if (forceImageRefresh) {
-    loadingState = Boolean(fileId);
+    loadingState = Boolean(displayFileId);
   } else if (keepExistingSrc) {
     loadingState = false;
   } else if (existingEntry?.loading && !cachedData) {
     loadingState = true;
   } else {
-    loadingState = Boolean(fileId) && !cachedData;
+    loadingState = Boolean(displayFileId) && !cachedData;
   }
 
   return {
     ...existingEntry,
     ...entry,
+    displayFileId,
     src: keepExistingSrc ? existingEntry.src : (cachedData && !forceImageRefresh ? cachedData.url : null),
     loading: loadingState,
   };
@@ -398,7 +414,7 @@ async function fetchGalleryPage(cursor = null, limit = PAGE_SIZE) {
 }
 
 async function loadEntryImage(entry) {
-  const fileId = entry.telegram?.file_id;
+  const fileId = getDisplayFileId(entry);
   if (!fileId) return;
   if (entry.src && !entry.loading) return;
   if (pendingImageLoads.has(fileId)) return;
@@ -406,6 +422,7 @@ async function loadEntryImage(entry) {
   pendingImageLoads.add(fileId);
   try {
     const imageUrl = buildFileUrl(fileId, false);
+    entry.displayFileId = fileId;
     entry.src = imageUrl;
     entry.loading = false;
     setImageCache(fileId, imageUrl);
@@ -419,7 +436,7 @@ async function loadEntryImage(entry) {
 
 function queueImageLoads(targetEntries) {
   targetEntries.forEach((entry) => {
-    if (!entry.telegram?.file_id) return;
+    if (!getDisplayFileId(entry)) return;
     if (entry.src && !entry.loading) return;
     void loadEntryImage(entry);
   });
@@ -562,15 +579,17 @@ function setupLoadMoreObserver() {
 }
 
 async function refreshSingleImage(entry) {
-  if (!entry.telegram?.file_id) return;
+  const displayFileId = getDisplayFileId(entry);
+  if (!displayFileId) return;
 
   entry.loading = true;
   try {
-    const imageUrl = buildFileUrl(entry.telegram.file_id, true);
+    const imageUrl = buildFileUrl(displayFileId, true);
+    entry.displayFileId = displayFileId;
     entry.src = imageUrl;
     entry.loading = false;
 
-    setImageCache(entry.telegram.file_id, buildFileUrl(entry.telegram.file_id, false));
+    setImageCache(displayFileId, buildFileUrl(displayFileId, false));
   } catch (err) {
     console.error('Failed to refresh image:', err);
     entry.loading = false;
@@ -590,8 +609,9 @@ async function clearImageCache() {
 
     entries.value = entries.value.map((entry) => ({
       ...entry,
+      displayFileId: getDisplayFileId(entry),
       src: null,
-      loading: Boolean(entry.telegram?.file_id)
+      loading: Boolean(getDisplayFileId(entry))
     }));
 
     toastMessage.value = '图片缓存已清除，正在重新加载';
