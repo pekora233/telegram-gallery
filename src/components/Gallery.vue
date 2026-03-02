@@ -185,6 +185,26 @@ async function performBatchDelete() {
 // 图片缓存管理（永久缓存）
 const IMAGE_CACHE_KEY = 'gallery_image_cache';
 const GALLERY_LIST_CACHE_KEY = 'gallery_list_cache';
+const LOCAL_STORAGE_CACHE_KEYS = [
+  IMAGE_CACHE_KEY,
+  GALLERY_LIST_CACHE_KEY,
+];
+
+function clearLocalStorageCaches() {
+  const keysToRemove = new Set(LOCAL_STORAGE_CACHE_KEYS);
+
+  // Also clear legacy cache keys that follow gallery_*_cache.
+  for (let i = 0; i < localStorage.length; i += 1) {
+    const key = localStorage.key(i);
+    if (key && key.startsWith('gallery_') && key.endsWith('_cache')) {
+      keysToRemove.add(key);
+    }
+  }
+
+  keysToRemove.forEach((key) => {
+    localStorage.removeItem(key);
+  });
+}
 
 function normalizeImageCache(cache) {
   if (!cache || typeof cache !== 'object' || Array.isArray(cache)) {
@@ -448,7 +468,7 @@ async function fetchGalleryPage(cursor = null, limit = PAGE_SIZE, sort = 'desc')
     return {
       items,
       hasMore: items.length >= limit,
-      nextCursor: items.length > 0 ? items[items.length - 1].id : null,
+      nextCursor: items.length > 0 ? (items[items.length - 1].timestamp || null) : null,
     };
   }
 
@@ -554,7 +574,6 @@ function mergeTopPage(serverItems, forceImageRefresh = false, keepExistingTail =
 async function load(forceImageRefresh = false, forceListRefresh = false) {
   error.value = "";
   const hadEntries = entries.value.length > 0;
-  let loadedFromCache = false;
 
   const currentSort = displayMode.value === 'asc' ? 'asc' : 'desc';
 
@@ -587,7 +606,6 @@ async function load(forceImageRefresh = false, forceListRefresh = false) {
       renderCount.value = RENDER_BATCH;
       queueImageLoads(entries.value.slice(0, renderCount.value));
       loading.value = false;
-      loadedFromCache = true;
     } else {
       loading.value = true;
     }
@@ -598,7 +616,7 @@ async function load(forceImageRefresh = false, forceListRefresh = false) {
   try {
     const page = await fetchGalleryPage(null, PAGE_SIZE, currentSort);
     // 如果从缓存加载了数据，保留缓存的尾部（服务器只返回首页60条）
-    mergeTopPage(page.items, forceImageRefresh, loadedFromCache || forceListRefresh);
+    mergeTopPage(page.items, forceImageRefresh, hadEntries);
 
     // 写入 IndexedDB 缓存
     if (useIDB && page.items.length > 0) {
@@ -872,7 +890,7 @@ function cancelClearCache() {
 async function performClearCache() {
   showClearCacheModal.value = false;
   try {
-    localStorage.removeItem(IMAGE_CACHE_KEY);
+    clearLocalStorageCaches();
 
     // 清除 IndexedDB 所有数据（图片缓存 + 元数据缓存）
     if (useIDB) {

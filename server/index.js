@@ -234,6 +234,35 @@ async function handleGallery(request, env) {
     const cursor = typeof cursorRaw === 'string' ? cursorRaw.trim() : '';
     const ascending = sortRaw === 'asc';
     const wantsPagination = limitRaw !== null || Boolean(cursor);
+    const decodeCursor = (rawCursor) => {
+      if (!rawCursor) return null;
+
+      // Backward compatibility for old "timestamp|id" cursor format.
+      const legacySep = rawCursor.indexOf('|');
+      if (legacySep > 0) {
+        rawCursor = rawCursor.slice(0, legacySep);
+      }
+
+      if (rawCursor.startsWith('d:')) {
+        const date = new Date(rawCursor.slice(2));
+        if (!Number.isNaN(date.getTime())) return date;
+        return rawCursor.slice(2);
+      }
+
+      if (rawCursor.startsWith('r:')) {
+        return rawCursor.slice(2);
+      }
+
+      const date = new Date(rawCursor);
+      if (!Number.isNaN(date.getTime())) return date;
+      return rawCursor;
+    };
+    const encodeCursor = (value) => {
+      if (value instanceof Date) {
+        return `d:${value.toISOString()}`;
+      }
+      return `r:${String(value ?? '')}`;
+    };
 
     const toGalleryItem = (d) => ({
       id: d._id.toString(),
@@ -258,28 +287,15 @@ async function handleGallery(request, env) {
 
       let query = {};
       if (cursor) {
-        // Compound cursor format: "timestamp|id"
-        const sepIdx = cursor.indexOf('|');
-        if (sepIdx === -1 || !ObjectId.isValid(cursor.slice(sepIdx + 1))) {
-          return jsonResponse({ error: 'Invalid cursor' }, 400);
-        }
-        const cursorTs = cursor.slice(0, sepIdx);
-        const cursorId = cursor.slice(sepIdx + 1);
         const op = ascending ? '$gt' : '$lt';
-        // 用原始字符串比较（timestamp 在 MongoDB 中可能是 string 或 Date）
-        // ISO 8601 字符串的字典序 === 时间顺序，所以直接用字符串比较即可
-        query = {
-          $or: [
-            { timestamp: { [op]: cursorTs } },
-            { timestamp: cursorTs, _id: { [op]: new ObjectId(cursorId) } },
-          ],
-        };
+        const cursorValue = decodeCursor(cursor);
+        query = { timestamp: { [op]: cursorValue } };
       }
 
       const sortDir = ascending ? 1 : -1;
       const docs = await collection
         .find(query, { projection: { prompt: 1, metadata: 1, telegram: 1, timestamp: 1 } })
-        .sort({ timestamp: sortDir, _id: sortDir })
+        .sort({ timestamp: sortDir })
         .limit(limit + 1)
         .toArray();
 
@@ -288,7 +304,7 @@ async function handleGallery(request, env) {
       const items = pageDocs.map(toGalleryItem);
       const lastDoc = pageDocs[pageDocs.length - 1];
       const nextCursor = hasMore && lastDoc
-        ? `${lastDoc.timestamp instanceof Date ? lastDoc.timestamp.toISOString() : lastDoc.timestamp}|${lastDoc._id.toString()}`
+        ? encodeCursor(lastDoc.timestamp)
         : null;
 
       return jsonResponse(
