@@ -1,6 +1,12 @@
 <script setup>
 import { ref, onMounted, onUnmounted, computed, inject, nextTick, watch } from "vue";
 import ImageDetail from "./ImageDetail.vue";
+import {
+  putItems, getAllItems, deleteItem as dbDeleteItem, isAvailable as isIDBAvailable,
+  putImageBlob, getImageBlob, deleteImageBlob, clearAll, clearImageBlobs,
+} from "../utils/galleryDB.js";
+
+const useIDB = isIDBAvailable();
 
 const token = localStorage.getItem("gallery_token");
 const entries = ref([]);
@@ -9,9 +15,13 @@ const error = ref("");
 const selectedIndex = ref(-1);
 let pollTimer = null;
 let loadMoreObserver = null;
+let renderMoreObserver = null;
 const loadMoreAnchor = ref(null);
+const renderMoreAnchor = ref(null);
 const loadingMore = ref(false);
 const hasMore = ref(true);
+const RENDER_BATCH = 40;
+const renderCount = ref(RENDER_BATCH);
 const paginationCursor = ref(null);
 const PAGE_SIZE = 60;
 const pendingImageLoads = new Set();
@@ -22,13 +32,29 @@ let lastRootBackAt = 0;
 let hasDetailHistoryState = false;
 let suppressNextPopstate = false;
 
+// 显示模式：desc（倒序/默认）、asc（正序）、categories（分类）
+const displayMode = ref(localStorage.getItem('gallery_display_mode') || 'desc');
+
+// 分类数据
+const categoriesData = ref([]);
+const categoriesLoading = ref(false);
+const expandedCatId = ref(null);
+const categoryImages = ref({});
+
 // 从 App 提供的 theme 注入
 const theme = inject('theme', ref('light'));
 const toggleTheme = inject('toggleTheme', null);
+const setView = inject('setView', null);
+
+function logout() {
+  localStorage.removeItem("gallery_token");
+  location.reload();
+}
 
 // 删除模态与提示
 const showDeleteModal = ref(false);
 const pendingDelete = ref(null);
+const showClearCacheModal = ref(false);
 const toastMessage = ref('');
 const showToast = ref(false);
 const batchMode = ref(false);
@@ -229,8 +255,9 @@ function setImageCache(fileId, url) {
   }
 }
 
-function buildFileUrl(fileId, withCacheBust = false) {
-  const base = `/api/file/${encodeURIComponent(fileId)}/image`;
+function buildFileUrl(fileId, ext, withCacheBust = false) {
+  const filename = ext ? `image.${ext}` : 'image';
+  const base = `/api/file/${encodeURIComponent(fileId)}/${filename}`;
   if (withCacheBust) {
     return `${base}?t=${Date.now()}`;
   }
@@ -239,6 +266,13 @@ function buildFileUrl(fileId, withCacheBust = false) {
 
 function getDisplayFileId(entry) {
   return entry?.telegram?.file_id_lossy || entry?.telegram?.file_id || null;
+}
+
+function getDisplayFormat(entry) {
+  if (entry?.telegram?.file_id_lossy && entry?.telegram?.file_id_lossy_format) {
+    return entry.telegram.file_id_lossy_format;
+  }
+  return entry?.telegram?.file_id_format || null;
 }
 
 function getGalleryListCache() {
@@ -321,6 +355,17 @@ function restoreHiddenEntry(snapshot) {
 function finalizeDeleteSuccess(entry) {
   pendingDeleteIds.delete(entry.id);
   removeEntryFromLocalCache(entry);
+  if (useIDB) {
+    dbDeleteItem(entry.id).catch((e) =>
+      console.warn('Failed to delete from IDB:', e)
+    );
+    const fileId = getDisplayFileId(entry);
+    if (fileId) {
+      deleteImageBlob(fileId).catch((e) =>
+        console.warn('Failed to delete image blob from IDB:', e)
+      );
+    }
+  }
   syncSelectionWithEntries();
 }
 
@@ -376,10 +421,11 @@ function buildEntryWithCache(entry, existingEntry, imageCache, forceImageRefresh
   };
 }
 
-async function fetchGalleryPage(cursor = null, limit = PAGE_SIZE) {
+async function fetchGalleryPage(cursor = null, limit = PAGE_SIZE, sort = 'desc') {
   const params = new URLSearchParams();
   params.set('limit', String(limit));
   if (cursor) params.set('cursor', cursor);
+  if (sort === 'asc') params.set('sort', 'asc');
 
   const resp = await fetch(`/api/gallery?${params.toString()}`, {
     headers: { Authorization: `Bearer ${token}` }
@@ -421,14 +467,48 @@ async function loadEntryImage(entry) {
 
   pendingImageLoads.add(fileId);
   try {
-    const imageUrl = buildFileUrl(fileId, false);
+    // 优先从 IndexedDB 读取缓存的图片 blob
+    if (useIDB) {
+      try {
+        const cachedBlob = await getImageBlob(fileId);
+        if (cachedBlob) {
+          entry.displayFileId = fileId;
+          entry.src = URL.createObjectURL(cachedBlob);
+          entry.loading = false;
+          return;
+        }
+      } catch (e) {
+        // IDB 读取失败，继续从服务器加载
+      }
+    }
+
+    // 从服务器获取图片并缓存 blob
+    const fmt = getDisplayFormat(entry);
+    const imageUrl = buildFileUrl(fileId, fmt, false);
+    const resp = await fetch(imageUrl);
+    if (!resp.ok) throw new Error('Failed to fetch image');
+    const blob = await resp.blob();
+
+    entry.displayFileId = fileId;
+    entry.src = URL.createObjectURL(blob);
+    entry.loading = false;
+
+    // 写入 IndexedDB 缓存（fire-and-forget）
+    if (useIDB) {
+      putImageBlob(fileId, blob).catch((e) =>
+        console.warn('Failed to cache image blob in IDB:', e)
+      );
+    }
+
+    setImageCache(fileId, imageUrl);
+  } catch (err) {
+    console.error('Failed to load image:', err);
+    // 回退到直接 URL
+    const imageUrl = buildFileUrl(fileId, getDisplayFormat(entry), false);
     entry.displayFileId = fileId;
     entry.src = imageUrl;
     entry.loading = false;
     setImageCache(fileId, imageUrl);
-  } catch (err) {
-    console.error('Failed to load image:', err);
-    entry.loading = false;
   } finally {
     pendingImageLoads.delete(fileId);
   }
@@ -453,32 +533,61 @@ function mergeTopPage(serverItems, forceImageRefresh = false, keepExistingTail =
   if (keepExistingTail) {
     const topIds = new Set(topEntries.map((entry) => entry.id));
     const tail = entries.value.filter((entry) => !topIds.has(entry.id));
-    entries.value = [...topEntries, ...tail];
+    const combined = [...topEntries, ...tail];
+    // 按当前排序方向排序，确保 IDB 缓存和服务器数据正确交错
+    const dir = displayMode.value === 'asc' ? 1 : -1;
+    combined.sort((a, b) => {
+      const ta = new Date(a.timestamp).getTime();
+      const tb = new Date(b.timestamp).getTime();
+      return ta !== tb ? (ta - tb) * dir : a.id.localeCompare(b.id) * dir;
+    });
+    entries.value = combined;
   } else {
     entries.value = topEntries;
   }
 
   setGalleryListCache(visibleServerList);
-  queueImageLoads(entries.value);
+  queueImageLoads(entries.value.slice(0, renderCount.value));
   syncSelectionWithEntries();
 }
 
 async function load(forceImageRefresh = false, forceListRefresh = false) {
   error.value = "";
   const hadEntries = entries.value.length > 0;
+  let loadedFromCache = false;
 
-  if (!forceListRefresh) {
-    const cachedList = getGalleryListCache();
-    if (cachedList && cachedList.length > 0) {
-      const visibleCachedList = cachedList
-        .slice(0, PAGE_SIZE)
-        .filter((e) => !pendingDeleteIds.has(e.id));
+  const currentSort = displayMode.value === 'asc' ? 'asc' : 'desc';
+
+  if (!forceListRefresh && !hadEntries) {
+    let cachedItems = null;
+
+    // 优先从 IndexedDB 读取所有缓存（按当前排序方向）
+    if (useIDB) {
+      try {
+        cachedItems = await getAllItems(undefined, currentSort);
+      } catch (e) {
+        // IDB 失败，回退到 localStorage
+      }
+    }
+
+    // 回退到 localStorage（仅倒序模式）
+    if ((!cachedItems || cachedItems.length === 0) && currentSort === 'desc') {
+      const lsCache = getGalleryListCache();
+      if (lsCache && lsCache.length > 0) {
+        cachedItems = lsCache.slice(0, PAGE_SIZE);
+      }
+    }
+
+    if (cachedItems && cachedItems.length > 0) {
+      const visibleCachedList = cachedItems.filter((e) => !pendingDeleteIds.has(e.id));
       const imageCache = forceImageRefresh ? {} : getImageCache();
       entries.value = visibleCachedList.map((entry) =>
         buildEntryWithCache(entry, null, imageCache, forceImageRefresh)
       );
-      queueImageLoads(entries.value);
+      renderCount.value = RENDER_BATCH;
+      queueImageLoads(entries.value.slice(0, renderCount.value));
       loading.value = false;
+      loadedFromCache = true;
     } else {
       loading.value = true;
     }
@@ -487,17 +596,26 @@ async function load(forceImageRefresh = false, forceListRefresh = false) {
   }
 
   try {
-    const page = await fetchGalleryPage(null, PAGE_SIZE);
-    mergeTopPage(page.items, forceImageRefresh, forceListRefresh);
+    const page = await fetchGalleryPage(null, PAGE_SIZE, currentSort);
+    // 如果从缓存加载了数据，保留缓存的尾部（服务器只返回首页60条）
+    mergeTopPage(page.items, forceImageRefresh, loadedFromCache || forceListRefresh);
 
-    if (!forceListRefresh || !hadEntries) {
-      paginationCursor.value = page.nextCursor;
-      hasMore.value = page.hasMore;
-    } else if (!paginationCursor.value) {
-      paginationCursor.value = page.nextCursor;
+    // 写入 IndexedDB 缓存
+    if (useIDB && page.items.length > 0) {
+      putItems(page.items).catch((e) =>
+        console.warn('Failed to cache items in IDB:', e)
+      );
     }
+
+    // 始终用服务器的分页状态，确保能发现所有新入库的数据
+    paginationCursor.value = page.nextCursor;
+    hasMore.value = page.hasMore;
   } catch (e) {
     error.value = String(e);
+    // 有缓存数据时不显示错误
+    if (entries.value.length > 0) {
+      error.value = "";
+    }
   } finally {
     loading.value = false;
     if (!loadMoreObserver) {
@@ -514,7 +632,8 @@ async function loadMore() {
 
   loadingMore.value = true;
   try {
-    const page = await fetchGalleryPage(paginationCursor.value, PAGE_SIZE);
+    const currentSort = displayMode.value === 'asc' ? 'asc' : 'desc';
+    const page = await fetchGalleryPage(paginationCursor.value, PAGE_SIZE, currentSort);
     const visibleItems = page.items.filter((entry) => !pendingDeleteIds.has(entry.id));
     const imageCache = getImageCache();
     const existingIds = new Set(entries.value.map((entry) => entry.id));
@@ -527,13 +646,34 @@ async function loadMore() {
     });
 
     if (appendedEntries.length > 0) {
-      entries.value = [...entries.value, ...appendedEntries];
-      queueImageLoads(appendedEntries);
+      // 将新数据插入到正确的排序位置（而非简单追加到末尾）
+      const combined = [...entries.value, ...appendedEntries];
+      const dir = currentSort === 'asc' ? 1 : -1;
+      combined.sort((a, b) => {
+        const ta = new Date(a.timestamp).getTime();
+        const tb = new Date(b.timestamp).getTime();
+        return ta !== tb ? (ta - tb) * dir : a.id.localeCompare(b.id) * dir;
+      });
+      entries.value = combined;
       syncSelectionWithEntries();
     }
 
     paginationCursor.value = page.nextCursor;
     hasMore.value = page.hasMore;
+
+    // 写入 IndexedDB 缓存
+    if (useIDB && page.items.length > 0) {
+      putItems(page.items).catch((e) =>
+        console.warn('Failed to cache paginated items in IDB:', e)
+      );
+    }
+
+    // 如果服务器返回的数据全部已存在（IDB 缓存重复），且还有更多数据，继续加载
+    if (appendedEntries.length === 0 && page.hasMore && page.nextCursor) {
+      loadingMore.value = false;
+      void loadMore();
+      return;
+    }
   } catch (e) {
     error.value = String(e);
   } finally {
@@ -578,50 +718,182 @@ function setupLoadMoreObserver() {
   loadMoreObserver.observe(loadMoreAnchor.value);
 }
 
+function renderMore() {
+  if (renderCount.value >= entries.value.length) return;
+  const newCount = Math.min(renderCount.value + RENDER_BATCH, entries.value.length);
+  renderCount.value = newCount;
+  const newlyRendered = entries.value.slice(renderCount.value - RENDER_BATCH, renderCount.value);
+  queueImageLoads(newlyRendered);
+}
+
+function setupRenderMoreObserver() {
+  if (typeof window === 'undefined' || !('IntersectionObserver' in window)) return;
+  if (!renderMoreAnchor.value) return;
+
+  if (renderMoreObserver) {
+    renderMoreObserver.disconnect();
+  }
+
+  renderMoreObserver = new IntersectionObserver(
+    (observedEntries) => {
+      if (observedEntries.some((item) => item.isIntersecting)) {
+        renderMore();
+      }
+    },
+    {
+      root: null,
+      rootMargin: '800px 0px 800px 0px',
+      threshold: 0.01,
+    }
+  );
+
+  renderMoreObserver.observe(renderMoreAnchor.value);
+}
+
+// ========== 分类模式 ==========
+
+const sortedCategories = computed(() => {
+  return [...categoriesData.value].sort((a, b) => b.count - a.count);
+});
+
+async function loadCategories() {
+  if (categoriesData.value.length > 0) return; // 已加载过
+  categoriesLoading.value = true;
+  try {
+    const resp = await fetch("/api/gallery/categories", {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!resp.ok) throw new Error("Failed to load categories");
+    const data = await resp.json();
+    categoriesData.value = data.categories || [];
+  } catch (e) {
+    error.value = String(e);
+  } finally {
+    categoriesLoading.value = false;
+  }
+}
+
+async function toggleCategory(catId) {
+  if (expandedCatId.value === catId) {
+    expandedCatId.value = null;
+    return;
+  }
+  expandedCatId.value = catId;
+  const cat = categoriesData.value.find((c) => c.id === catId);
+  if (!cat) return;
+  for (const itemId of cat.items.slice(0, 20)) {
+    if (categoryImages.value[itemId]) continue;
+    loadCategoryImage(itemId);
+  }
+}
+
+async function loadCategoryImage(itemId) {
+  try {
+    const items = await getAllItems();
+    const entry = items.find((e) => e.id === itemId);
+    if (entry) {
+      const fileId = entry.telegram?.file_id_lossy || entry.telegram?.file_id;
+      if (fileId) {
+        const blob = await getImageBlob(fileId);
+        if (blob) {
+          categoryImages.value[itemId] = {
+            src: URL.createObjectURL(blob),
+            entry,
+          };
+          return;
+        }
+        const fmt = entry.telegram?.file_id_lossy_format || entry.telegram?.file_id_format || null;
+        const filename = fmt ? `image.${fmt}` : 'image';
+        categoryImages.value[itemId] = {
+          src: `/api/file/${encodeURIComponent(fileId)}/${filename}`,
+          entry,
+        };
+      }
+    }
+  } catch (e) { /* IDB unavailable */ }
+}
+
+function setDisplayMode(mode) {
+  if (displayMode.value === mode) return;
+  const prevMode = displayMode.value;
+  displayMode.value = mode;
+  localStorage.setItem('gallery_display_mode', mode);
+  renderCount.value = RENDER_BATCH;
+
+  if (mode === 'categories') {
+    loadCategories();
+  } else if (prevMode === 'categories') {
+    // 从分类切回列表，不需要重新加载（entries 还在）
+  } else {
+    // asc <-> desc 切换，跳过 IDB 缓存直接从服务器加载
+    entries.value = [];
+    paginationCursor.value = null;
+    hasMore.value = true;
+    load(false, true);
+  }
+}
+
 async function refreshSingleImage(entry) {
   const displayFileId = getDisplayFileId(entry);
   if (!displayFileId) return;
 
   entry.loading = true;
   try {
-    const imageUrl = buildFileUrl(displayFileId, true);
+    const imageUrl = buildFileUrl(displayFileId, getDisplayFormat(entry), true);
+    const resp = await fetch(imageUrl);
+    if (!resp.ok) throw new Error('Failed to fetch image');
+    const blob = await resp.blob();
+
     entry.displayFileId = displayFileId;
-    entry.src = imageUrl;
+    entry.src = URL.createObjectURL(blob);
     entry.loading = false;
 
-    setImageCache(displayFileId, buildFileUrl(displayFileId, false));
+    if (useIDB) {
+      putImageBlob(displayFileId, blob).catch((e) =>
+        console.warn('Failed to cache refreshed image blob:', e)
+      );
+    }
+
+    setImageCache(displayFileId, buildFileUrl(displayFileId, getDisplayFormat(entry), false));
   } catch (err) {
     console.error('Failed to refresh image:', err);
     entry.loading = false;
   }
 }
 
-function forceRefreshAll() {
-  load(false, true);
+function showClearCacheConfirm() {
+  showClearCacheModal.value = true;
 }
 
-async function clearImageCache() {
-  const ok = window.confirm('确定要清除图片缓存吗？清除后会重新加载图片。');
-  if (!ok) return;
+function cancelClearCache() {
+  showClearCacheModal.value = false;
+}
 
+async function performClearCache() {
+  showClearCacheModal.value = false;
   try {
     localStorage.removeItem(IMAGE_CACHE_KEY);
 
-    entries.value = entries.value.map((entry) => ({
-      ...entry,
-      displayFileId: getDisplayFileId(entry),
-      src: null,
-      loading: Boolean(getDisplayFileId(entry))
-    }));
+    // 清除 IndexedDB 所有数据（图片缓存 + 元数据缓存）
+    if (useIDB) {
+      await Promise.all([
+        clearAll().catch((e) => console.warn('Failed to clear IDB items:', e)),
+        clearImageBlobs().catch((e) => console.warn('Failed to clear IDB image blobs:', e)),
+      ]);
+    }
 
-    toastMessage.value = '图片缓存已清除，正在重新加载';
+    entries.value = [];
+    paginationCursor.value = null;
+    hasMore.value = true;
+
+    toastMessage.value = '所有缓存已清除，正在重新加载';
     showToast.value = true;
     setTimeout(() => { showToast.value = false; toastMessage.value = ''; }, 2500);
 
-    await load(true, false);
+    await load(true, true);
   } catch (e) {
-    console.error('Failed to clear image cache:', e);
-    toastMessage.value = '清除图片缓存失败: ' + String(e.message || e);
+    console.error('Failed to clear cache:', e);
+    toastMessage.value = '清除缓存失败: ' + String(e.message || e);
     showToast.value = true;
     setTimeout(() => { showToast.value = false; toastMessage.value = ''; }, 3500);
   }
@@ -672,11 +944,6 @@ function setSelectedImageIndex(index) {
 watch(selectedIndex, (index) => {
   maybeLoadMoreForDetail(index);
 });
-
-function logout() {
-  localStorage.removeItem('gallery_token');
-  location.reload();
-}
 
 // 解析 prompt 为 tags
 function parseTags(prompt) {
@@ -777,11 +1044,15 @@ function getTagColor(tag) {
 
 // 瀑布流左右优先：将图片分配到多列
 const columnCount = ref(5);
+
+const renderedEntries = computed(() => entries.value.slice(0, renderCount.value));
+const hasMoreToRender = computed(() => renderCount.value < entries.value.length);
+
 const columns = computed(() => {
   const cols = Array.from({ length: columnCount.value }, () => []);
   const heights = new Array(columnCount.value).fill(0);
 
-  entries.value.forEach((entry) => {
+  renderedEntries.value.forEach((entry) => {
     const minIndex = heights.indexOf(Math.min(...heights));
     cols[minIndex].push(entry);
     heights[minIndex] += 1;
@@ -849,6 +1120,7 @@ onMounted(() => {
   window.addEventListener('popstate', handlePopState);
   nextTick(() => {
     setupLoadMoreObserver();
+    setupRenderMoreObserver();
   });
 
   pollTimer = setInterval(() => {
@@ -867,22 +1139,61 @@ onUnmounted(() => {
     loadMoreObserver.disconnect();
     loadMoreObserver = null;
   }
+  if (renderMoreObserver) {
+    renderMoreObserver.disconnect();
+    renderMoreObserver = null;
+  }
 });
 </script>
 
 <template>
   <div class="gallery-container">
-    <!-- 顶部导航栏 -->
+    <!-- 工具栏 -->
     <header class="top-header">
       <div class="header-content">
         <div class="header-left">
-          <h1 class="header-title">Gallery</h1>
-          <div class="header-stats" v-if="entries.length > 0">
+          <!-- 显示模式切换 -->
+          <div class="mode-switcher">
+            <button
+              :class="['mode-btn', { active: displayMode === 'desc' }]"
+              @click="setDisplayMode('desc')"
+              title="倒序（最新在前）"
+            >
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <line x1="12" y1="5" x2="12" y2="19"/>
+                <polyline points="19 12 12 19 5 12"/>
+              </svg>
+              <span class="mode-label">倒序</span>
+            </button>
+            <button
+              :class="['mode-btn', { active: displayMode === 'asc' }]"
+              @click="setDisplayMode('asc')"
+              title="正序（最早在前）"
+            >
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <line x1="12" y1="19" x2="12" y2="5"/>
+                <polyline points="5 12 12 5 19 12"/>
+              </svg>
+              <span class="mode-label">正序</span>
+            </button>
+            <button
+              :class="['mode-btn', { active: displayMode === 'categories' }]"
+              @click="setDisplayMode('categories')"
+              title="按分类显示"
+            >
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M22 19a2 2 0 01-2 2H4a2 2 0 01-2-2V5a2 2 0 012-2h5l2 3h9a2 2 0 012 2z"/>
+              </svg>
+              <span class="mode-label">分类</span>
+            </button>
+          </div>
+
+          <div class="header-stats" v-if="entries.length > 0 && displayMode !== 'categories'">
             <span class="stats-count">{{ entries.length }}</span>
             <span class="stats-label">images</span>
           </div>
         </div>
-        
+
         <div class="header-right">
           <!-- 批量模式控制 -->
           <template v-if="batchMode">
@@ -907,16 +1218,10 @@ onUnmounted(() => {
               </svg>
             </button>
           </template>
-          
+
           <!-- 普通模式控制 -->
           <template v-else>
-            <button @click="forceRefreshAll" class="header-btn" title="刷新全部图片">
-              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                <polyline points="23 4 23 10 17 10"/>
-                <path d="M20.49 15a9 9 0 11-2.12-9.36L23 10"/>
-              </svg>
-            </button>
-            <button @click="clearImageCache" class="header-btn" title="清除图片缓存">
+            <button @click="showClearCacheConfirm" class="header-btn" title="清除所有缓存">
               <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                 <polyline points="3 6 5 6 21 6"/>
                 <path d="M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6m3 0V4a2 2 0 012-2h4a2 2 0 012 2v2"/>
@@ -930,7 +1235,14 @@ onUnmounted(() => {
                 <path d="M21 12v7a2 2 0 01-2 2H5a2 2 0 01-2-2V5a2 2 0 012-2h11"/>
               </svg>
             </button>
-            <div class="header-divider"></div>
+            <span class="header-divider"></span>
+            <button v-if="setView" @click="setView('database')" class="header-btn" title="数据库">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <ellipse cx="12" cy="5" rx="9" ry="3"/>
+                <path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/>
+                <path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/>
+              </svg>
+            </button>
             <button v-if="toggleTheme" @click="toggleTheme()" class="header-btn" :title="theme === 'light' ? '切换深色模式' : '切换亮色模式'">
               <svg v-if="theme === 'light'" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                 <path d="M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z"/>
@@ -983,6 +1295,29 @@ onUnmounted(() => {
       </div>
     </transition>
 
+    <!-- 清除缓存确认模态框 -->
+    <transition name="modal-fade">
+      <div v-if="showClearCacheModal" class="modal-overlay" @click.self="cancelClearCache">
+        <div class="modal-dialog">
+          <div class="modal-content">
+            <div class="modal-icon warning">
+              <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/>
+                <line x1="12" y1="9" x2="12" y2="13"/>
+                <line x1="12" y1="17" x2="12.01" y2="17"/>
+              </svg>
+            </div>
+            <h3 class="modal-title">清除所有缓存</h3>
+            <p class="modal-desc">将清除本地所有图片缓存和元数据缓存，清除后会从服务器重新加载数据。</p>
+            <div class="modal-buttons">
+              <button class="modal-btn secondary" @click="cancelClearCache">取消</button>
+              <button class="modal-btn warning" @click="performClearCache">确认清除</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </transition>
+
     <!-- Toast 通知 -->
     <transition name="toast-slide">
       <div v-if="showToast" class="toast-notification">
@@ -1012,7 +1347,7 @@ onUnmounted(() => {
       </div>
 
       <!-- 批量模式提示 -->
-      <div v-if="batchMode" class="batch-mode-banner">
+      <div v-if="batchMode && displayMode !== 'categories'" class="batch-mode-banner">
         <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
           <path d="M9 11l3 3L22 4"/>
           <path d="M21 12v7a2 2 0 01-2 2H5a2 2 0 01-2-2V5a2 2 0 012-2h11"/>
@@ -1020,108 +1355,193 @@ onUnmounted(() => {
         <span>已选择 <strong>{{ selectedCount }}</strong> 张图片，点击图片可选择/取消选择</span>
       </div>
 
-      <!-- 瀑布流网格 -->
-      <div class="gallery-grid" v-if="!loading">
-        <div
-          v-for="(column, colIndex) in columns"
-          :key="colIndex"
-          class="grid-column"
-        >
-          <div
-            v-for="entry in column"
-            :key="entry.id"
-            :class="['image-card', { 'selected': batchMode && isEntrySelected(entry.id) }]"
-            @click="batchMode ? toggleEntrySelection(entry.id) : open(entry)"
-          >
-            <!-- 图片区域 -->
-            <div class="card-image-wrapper">
-              <!-- 选择按钮 -->
-              <button
-                v-if="batchMode"
-                :class="['select-checkbox', { 'checked': isEntrySelected(entry.id) }]"
-                @click.stop="toggleEntrySelection(entry.id)"
-                :title="isEntrySelected(entry.id) ? '取消选择' : '选择图片'"
-              >
-                <svg v-if="isEntrySelected(entry.id)" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3">
-                  <polyline points="20 6 9 17 4 12"/>
-                </svg>
-              </button>
-              
-              <!-- 图片 -->
-              <img
-                v-if="entry.src"
-                :src="entry.src"
-                :alt="entry.prompt"
-                class="card-image"
-                loading="lazy"
-              />
-              <div v-else class="card-placeholder">
-                <div class="placeholder-spinner"></div>
-              </div>
+      <!-- ====== 分类模式 ====== -->
+      <template v-if="displayMode === 'categories'">
+        <div v-if="categoriesLoading" class="loading-state">
+          <div class="loading-spinner"></div>
+          <p class="loading-text">正在分析图片分类...</p>
+        </div>
 
-              <!-- 操作按钮组 -->
-              <div class="card-actions">
-                <button
-                  class="action-btn delete"
-                  @click.stop="openDeleteModal(entry)"
-                  title="删除"
+        <div v-else-if="sortedCategories.length > 0" class="categories-content">
+          <div class="categories-summary">
+            <span class="stats-count">{{ sortedCategories.length }}</span>
+            <span class="stats-label">个分类</span>
+            <span class="stats-sep">/</span>
+            <span class="stats-count">{{ entries.length }}</span>
+            <span class="stats-label">张图片</span>
+          </div>
+
+          <div class="categories-list">
+            <div
+              v-for="cat in sortedCategories"
+              :key="cat.id"
+              :class="['cat-card', { expanded: expandedCatId === cat.id }]"
+            >
+              <div class="cat-header" @click="toggleCategory(cat.id)">
+                <div class="cat-header-left">
+                  <span class="cat-count">{{ cat.count }}</span>
+                  <div class="cat-tags">
+                    <span
+                      v-for="(tag, idx) in cat.tags.slice(0, 6)"
+                      :key="idx"
+                      class="tag"
+                      :style="{ backgroundColor: getTagColor(tag).bg, color: getTagColor(tag).text, borderColor: getTagColor(tag).border }"
+                    >{{ tag }}</span>
+                    <span v-if="cat.tags.length > 6" class="tag-more">+{{ cat.tags.length - 6 }}</span>
+                  </div>
+                </div>
+                <svg
+                  :class="['cat-chevron', { rotated: expandedCatId === cat.id }]"
+                  width="20" height="20" viewBox="0 0 24 24"
+                  fill="none" stroke="currentColor" stroke-width="2"
                 >
-                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                    <polyline points="3 6 5 6 21 6"/>
-                    <path d="M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6m3 0V4a2 2 0 012-2h4a2 2 0 012 2v2"/>
-                  </svg>
-                </button>
+                  <polyline points="6 9 12 15 18 9"/>
+                </svg>
               </div>
-            </div>
 
-            <!-- 标签区域 -->
-            <div class="card-tags">
-              <span
-                v-for="(tag, idx) in parseTags(entry.prompt).slice(0, 5)"
-                :key="idx"
-                class="tag"
-                :style="{
-                  backgroundColor: getTagColor(tag).bg,
-                  color: getTagColor(tag).text,
-                  borderColor: getTagColor(tag).border
-                }"
-              >
-                {{ tag }}
-              </span>
-              <span v-if="parseTags(entry.prompt).length > 5" class="tag-more">
-                +{{ parseTags(entry.prompt).length - 5 }}
-              </span>
+              <div v-if="expandedCatId === cat.id" class="cat-images">
+                <div
+                  v-for="itemId in cat.items.slice(0, 20)"
+                  :key="itemId"
+                  class="cat-thumb"
+                >
+                  <img
+                    v-if="categoryImages[itemId]"
+                    :src="categoryImages[itemId].src"
+                    loading="lazy"
+                    alt=""
+                  />
+                  <div v-else class="cat-thumb-placeholder">
+                    <div class="placeholder-spinner"></div>
+                  </div>
+                </div>
+                <div v-if="cat.items.length > 20" class="cat-more-images">
+                  还有 {{ cat.items.length - 20 }} 张...
+                </div>
+              </div>
             </div>
           </div>
         </div>
-      </div>
 
-      <!-- 加载更多状态 -->
-      <div v-if="!loading && entries.length > 0" class="load-more-status">
-        <div v-if="loadingMore" class="status-loading">
-          <div class="mini-spinner"></div>
-          <span>加载更多...</span>
+        <div v-else-if="!categoriesLoading && !error" class="empty-state">
+          <p class="empty-text">暂无分类数据</p>
         </div>
-        <span v-else-if="hasMore" class="status-hint">下滑自动加载更多</span>
-        <span v-else class="status-end">— 已加载全部 —</span>
-      </div>
+      </template>
 
-      <div
-        ref="loadMoreAnchor"
-        class="load-more-anchor"
-        v-show="!loading && hasMore && entries.length > 0"
-        aria-hidden="true"
-      ></div>
+      <!-- ====== 瀑布流模式（正序/倒序） ====== -->
+      <template v-else>
+        <!-- 瀑布流网格 -->
+        <div class="gallery-grid" v-if="!loading">
+          <div
+            v-for="(column, colIndex) in columns"
+            :key="colIndex"
+            class="grid-column"
+          >
+            <div
+              v-for="entry in column"
+              :key="entry.id"
+              :class="['image-card', { 'selected': batchMode && isEntrySelected(entry.id) }]"
+              @click="batchMode ? toggleEntrySelection(entry.id) : open(entry)"
+            >
+              <!-- 图片区域 -->
+              <div class="card-image-wrapper">
+                <!-- 选择按钮 -->
+                <button
+                  v-if="batchMode"
+                  :class="['select-checkbox', { 'checked': isEntrySelected(entry.id) }]"
+                  @click.stop="toggleEntrySelection(entry.id)"
+                  :title="isEntrySelected(entry.id) ? '取消选择' : '选择图片'"
+                >
+                  <svg v-if="isEntrySelected(entry.id)" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3">
+                    <polyline points="20 6 9 17 4 12"/>
+                  </svg>
+                </button>
 
-      <!-- 空状态 -->
-      <div v-if="!loading && entries.length === 0" class="empty-state">
-        <svg width="64" height="64" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
-          <rect x="3" y="3" width="18" height="18" rx="2" ry="2"/>
-          <circle cx="8.5" cy="8.5" r="1.5"/>
-          <polyline points="21 15 16 10 5 21"/>
-        </svg>
-        <p class="empty-text">暂无图片</p>
-      </div>
+                <!-- 图片 -->
+                <img
+                  v-if="entry.src"
+                  :src="entry.src"
+                  :alt="entry.prompt"
+                  class="card-image"
+                  loading="lazy"
+                />
+                <div v-else class="card-placeholder">
+                  <div class="placeholder-spinner"></div>
+                </div>
+
+                <!-- 操作按钮组 -->
+                <div class="card-actions">
+                  <button
+                    class="action-btn delete"
+                    @click.stop="openDeleteModal(entry)"
+                    title="删除"
+                  >
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                      <polyline points="3 6 5 6 21 6"/>
+                      <path d="M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6m3 0V4a2 2 0 012-2h4a2 2 0 012 2v2"/>
+                    </svg>
+                  </button>
+                </div>
+              </div>
+
+              <!-- 标签区域 -->
+              <div class="card-tags" v-if="entry.prompt && parseTags(entry.prompt).length > 0">
+                <span
+                  v-for="(tag, idx) in parseTags(entry.prompt).slice(0, 5)"
+                  :key="idx"
+                  class="tag"
+                  :style="{
+                    backgroundColor: getTagColor(tag).bg,
+                    color: getTagColor(tag).text,
+                    borderColor: getTagColor(tag).border
+                  }"
+                >
+                  {{ tag }}
+                </span>
+                <span v-if="parseTags(entry.prompt).length > 5" class="tag-more">
+                  +{{ parseTags(entry.prompt).length - 5 }}
+                </span>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- 增量渲染锚点 -->
+        <div
+          ref="renderMoreAnchor"
+          class="load-more-anchor"
+          v-show="!loading && hasMoreToRender"
+          aria-hidden="true"
+        ></div>
+
+        <!-- 加载更多状态 -->
+        <div v-if="!loading && entries.length > 0" class="load-more-status">
+          <div v-if="loadingMore" class="status-loading">
+            <div class="mini-spinner"></div>
+            <span>加载更多...</span>
+          </div>
+          <span v-else-if="hasMoreToRender" class="status-hint">{{ renderedEntries.length }} / {{ entries.length }}</span>
+          <span v-else-if="hasMore" class="status-hint">下滑自动加载更多</span>
+          <span v-else class="status-end">— 已加载全部 {{ entries.length }} 张 —</span>
+        </div>
+
+        <div
+          ref="loadMoreAnchor"
+          class="load-more-anchor"
+          v-show="!loading && hasMore && !hasMoreToRender && entries.length > 0"
+          aria-hidden="true"
+        ></div>
+
+        <!-- 空状态 -->
+        <div v-if="!loading && entries.length === 0" class="empty-state">
+          <svg width="64" height="64" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+            <rect x="3" y="3" width="18" height="18" rx="2" ry="2"/>
+            <circle cx="8.5" cy="8.5" r="1.5"/>
+            <polyline points="21 15 16 10 5 21"/>
+          </svg>
+          <p class="empty-text">暂无图片</p>
+        </div>
+      </template>
     </main>
 
     <!-- 详情弹窗 -->
@@ -1159,7 +1579,7 @@ onUnmounted(() => {
 .header-content {
   max-width: 1600px;
   margin: 0 auto;
-  padding: 0.875rem 1.25rem;
+  padding: 0.5rem 1.25rem;
   display: flex;
   justify-content: space-between;
   align-items: center;
@@ -1256,6 +1676,13 @@ onUnmounted(() => {
   flex-shrink: 0;
 }
 
+.header-divider {
+  width: 1px;
+  height: 1.25rem;
+  background: var(--border-color);
+  flex-shrink: 0;
+}
+
 /* ========== 模态框 ========== */
 .modal-overlay {
   position: fixed;
@@ -1299,6 +1726,11 @@ onUnmounted(() => {
 .modal-icon.danger {
   background: rgba(239, 68, 68, 0.1);
   color: #ef4444;
+}
+
+.modal-icon.warning {
+  background: rgba(245, 158, 11, 0.1);
+  color: #f59e0b;
 }
 
 .modal-title {
@@ -1362,6 +1794,15 @@ onUnmounted(() => {
 
 .modal-btn.danger:hover {
   background: #dc2626;
+}
+
+.modal-btn.warning {
+  background: #f59e0b;
+  color: white;
+}
+
+.modal-btn.warning:hover {
+  background: #d97706;
 }
 
 .modal-btn:active {
@@ -1808,6 +2249,185 @@ onUnmounted(() => {
   .batch-mode-banner {
     font-size: 0.813rem;
     padding: 0.75rem 1rem;
+  }
+}
+
+/* ========== 显示模式切换 ========== */
+.mode-switcher {
+  display: flex;
+  background: var(--bg-tertiary);
+  border-radius: 0.5rem;
+  padding: 0.125rem;
+  gap: 0.125rem;
+}
+
+.mode-btn {
+  display: flex;
+  align-items: center;
+  gap: 0.25rem;
+  padding: 0.375rem 0.625rem;
+  border: none;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 0.75rem;
+  font-weight: 500;
+  border-radius: 0.375rem;
+  cursor: pointer;
+  transition: all 0.2s;
+  white-space: nowrap;
+}
+
+.mode-btn:hover {
+  color: var(--text-primary);
+}
+
+.mode-btn.active {
+  background: var(--bg-secondary);
+  color: var(--primary);
+  box-shadow: 0 1px 2px rgba(0,0,0,0.08);
+}
+
+.mode-btn svg {
+  flex-shrink: 0;
+}
+
+.stats-sep {
+  color: var(--text-muted);
+  margin: 0 0.25rem;
+}
+
+/* ========== 分类模式 ========== */
+.categories-content {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+
+.categories-summary {
+  display: flex;
+  align-items: baseline;
+  gap: 0.375rem;
+  padding: 0.5rem 0.75rem;
+  background: var(--bg-tertiary);
+  border-radius: 0.5rem;
+  font-size: 0.813rem;
+}
+
+.categories-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.cat-card {
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: 0.75rem;
+  overflow: hidden;
+  transition: box-shadow 0.2s;
+}
+
+.cat-card:hover {
+  box-shadow: var(--shadow);
+}
+
+.cat-card.expanded {
+  box-shadow: var(--shadow-lg);
+}
+
+.cat-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.875rem 1rem;
+  cursor: pointer;
+  transition: background 0.2s;
+}
+
+.cat-header:hover {
+  background: var(--bg-tertiary);
+}
+
+.cat-header-left {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  min-width: 0;
+  flex: 1;
+}
+
+.cat-count {
+  font-size: 1rem;
+  font-weight: 700;
+  color: var(--primary);
+  background: var(--bg-tertiary);
+  padding: 0.125rem 0.625rem;
+  border-radius: 0.375rem;
+  flex-shrink: 0;
+}
+
+.cat-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.375rem;
+  min-width: 0;
+}
+
+.cat-chevron {
+  flex-shrink: 0;
+  color: var(--text-muted);
+  transition: transform 0.2s;
+}
+
+.cat-chevron.rotated {
+  transform: rotate(180deg);
+}
+
+.cat-images {
+  padding: 0 1rem 1rem;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
+  gap: 0.5rem;
+}
+
+.cat-thumb {
+  aspect-ratio: 1;
+  border-radius: 0.5rem;
+  overflow: hidden;
+  background: var(--bg-tertiary);
+}
+
+.cat-thumb img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.cat-thumb-placeholder {
+  width: 100%;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.cat-more-images {
+  grid-column: 1 / -1;
+  text-align: center;
+  padding: 0.5rem;
+  font-size: 0.813rem;
+  color: var(--text-muted);
+}
+
+@media (max-width: 576px) {
+  .mode-label {
+    display: none;
+  }
+  .mode-btn {
+    padding: 0.375rem 0.5rem;
+  }
+  .cat-images {
+    grid-template-columns: repeat(auto-fill, minmax(80px, 1fr));
   }
 }
 </style>

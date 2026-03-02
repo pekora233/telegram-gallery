@@ -25,12 +25,18 @@ function getDisplayFileId(entry) {
   return entry?.telegram?.file_id_lossy || entry?.telegram?.file_id || null;
 }
 
+function getOriginalFormat(entry) {
+  return entry?.telegram?.file_id_format || null;
+}
+
 const canDownloadOriginal = computed(() => Boolean(currentEntry.value?.telegram?.file_id));
 
 function getOriginalDownloadUrl() {
   const fileId = currentEntry.value?.telegram?.file_id;
   if (!fileId) return '';
-  return `/api/file/${encodeURIComponent(fileId)}/image?t=${Date.now()}`;
+  const fmt = getOriginalFormat(currentEntry.value);
+  const filename = fmt ? `image.${fmt}` : 'image';
+  return `/api/file/${encodeURIComponent(fileId)}/${filename}?t=${Date.now()}`;
 }
 
 const metaLines = computed(() => {
@@ -140,20 +146,26 @@ async function downloadOriginalImage() {
     let filename = filenameMatch ? filenameMatch[1] : null;
 
     if (!filename) {
-      const contentType = resp.headers.get('content-type') || 'image/png';
-      const extMap = {
-        'image/png': 'png',
-        'image/jpeg': 'jpg',
-        'image/webp': 'webp',
-        'image/gif': 'gif',
-        'image/avif': 'avif',
-        'image/jxl': 'jxl',
-        'image/bmp': 'bmp',
-      };
-      const base = contentType.split(';')[0].trim().toLowerCase();
-      const ext = extMap[base] || 'png';
-      const entryId = currentEntry.value?.id || Date.now();
-      filename = `image-${entryId}.${ext}`;
+      const fmt = getOriginalFormat(currentEntry.value);
+      if (fmt) {
+        const entryId = currentEntry.value?.id || Date.now();
+        filename = `image-${entryId}.${fmt}`;
+      } else {
+        const contentType = resp.headers.get('content-type') || 'image/png';
+        const extMap = {
+          'image/png': 'png',
+          'image/jpeg': 'jpg',
+          'image/webp': 'webp',
+          'image/gif': 'gif',
+          'image/avif': 'avif',
+          'image/jxl': 'jxl',
+          'image/bmp': 'bmp',
+        };
+        const base = contentType.split(';')[0].trim().toLowerCase();
+        const ext = extMap[base] || 'png';
+        const entryId = currentEntry.value?.id || Date.now();
+        filename = `image-${entryId}.${ext}`;
+      }
     }
 
     const blob = await resp.blob();
@@ -174,8 +186,10 @@ async function downloadOriginalImage() {
 
 function toPhotoSwipeItem(entry) {
   const displayFileId = getDisplayFileId(entry);
+  const fmt = entry?.telegram?.file_id_lossy_format || entry?.telegram?.file_id_format || null;
+  const filename = fmt ? `image.${fmt}` : 'image';
   const fallbackSrc = displayFileId
-    ? `/api/file/${encodeURIComponent(displayFileId)}/image`
+    ? `/api/file/${encodeURIComponent(displayFileId)}/${filename}`
     : '';
   return {
     src: entry?.src || fallbackSrc,

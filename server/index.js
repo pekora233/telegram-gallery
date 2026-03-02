@@ -230,7 +230,9 @@ async function handleGallery(request, env) {
     const url = new URL(request.url);
     const limitRaw = url.searchParams.get('limit');
     const cursorRaw = url.searchParams.get('cursor');
+    const sortRaw = url.searchParams.get('sort');
     const cursor = typeof cursorRaw === 'string' ? cursorRaw.trim() : '';
+    const ascending = sortRaw === 'asc';
     const wantsPagination = limitRaw !== null || Boolean(cursor);
 
     const toGalleryItem = (d) => ({
@@ -241,8 +243,11 @@ async function handleGallery(request, env) {
         chat_id: d.telegram?.chat_id || null,
         file_id: d.telegram?.file_id || null,
         file_id_lossy: d.telegram?.file_id_lossy || null,
+        file_id_format: d.telegram?.file_id_format || null,
+        file_id_lossy_format: d.telegram?.file_id_lossy_format || null,
+        prev_file_id_format: d.telegram?.prev_file_id_format || null,
       },
-      timestamp: d.timestamp,
+      timestamp: d.timestamp instanceof Date ? d.timestamp.toISOString() : (d.timestamp || null),
     });
 
     if (wantsPagination) {
@@ -253,23 +258,37 @@ async function handleGallery(request, env) {
 
       let query = {};
       if (cursor) {
-        if (!ObjectId.isValid(cursor)) {
+        // Compound cursor format: "timestamp|id"
+        const sepIdx = cursor.indexOf('|');
+        if (sepIdx === -1 || !ObjectId.isValid(cursor.slice(sepIdx + 1))) {
           return jsonResponse({ error: 'Invalid cursor' }, 400);
         }
-        query = { _id: { $lt: new ObjectId(cursor) } };
+        const cursorTs = cursor.slice(0, sepIdx);
+        const cursorId = cursor.slice(sepIdx + 1);
+        const op = ascending ? '$gt' : '$lt';
+        // 用原始字符串比较（timestamp 在 MongoDB 中可能是 string 或 Date）
+        // ISO 8601 字符串的字典序 === 时间顺序，所以直接用字符串比较即可
+        query = {
+          $or: [
+            { timestamp: { [op]: cursorTs } },
+            { timestamp: cursorTs, _id: { [op]: new ObjectId(cursorId) } },
+          ],
+        };
       }
 
+      const sortDir = ascending ? 1 : -1;
       const docs = await collection
         .find(query, { projection: { prompt: 1, metadata: 1, telegram: 1, timestamp: 1 } })
-        .sort({ _id: -1 })
+        .sort({ timestamp: sortDir, _id: sortDir })
         .limit(limit + 1)
         .toArray();
 
       const hasMore = docs.length > limit;
       const pageDocs = hasMore ? docs.slice(0, limit) : docs;
       const items = pageDocs.map(toGalleryItem);
-      const nextCursor = hasMore && pageDocs.length > 0
-        ? pageDocs[pageDocs.length - 1]._id.toString()
+      const lastDoc = pageDocs[pageDocs.length - 1];
+      const nextCursor = hasMore && lastDoc
+        ? `${lastDoc.timestamp instanceof Date ? lastDoc.timestamp.toISOString() : lastDoc.timestamp}|${lastDoc._id.toString()}`
         : null;
 
       return jsonResponse(
@@ -306,6 +325,7 @@ async function handleFileUrl(request, env) {
   const MONGO_URI = env.MONGO_URI;
   let botToken = env.BOT_TOKEN || null;
   let docId = null;
+  let dbFormat = null;
 
   if (MONGO_URI) {
     try {
@@ -325,6 +345,14 @@ async function handleFileUrl(request, env) {
             botToken = doc.telegram.bot_token;
           }
           docId = doc._id.toString();
+          // Determine format from DB based on which file_id matched
+          if (doc.telegram) {
+            if (file_id === doc.telegram.file_id && doc.telegram.file_id_format) {
+              dbFormat = doc.telegram.file_id_format;
+            } else if (file_id === doc.telegram.file_id_lossy && doc.telegram.file_id_lossy_format) {
+              dbFormat = doc.telegram.file_id_lossy_format;
+            }
+          }
         }
       } finally {
         await client.close();
@@ -340,10 +368,10 @@ async function handleFileUrl(request, env) {
 
   function buildImageResponse(imageResp, filePath) {
     const contentType = imageResp.headers.get('content-type') || 'application/octet-stream';
-    // Prefer extension from Telegram's file_path (e.g. "photos/file_1.png", "documents/file_2.jxl")
+    // Prefer format from DB, then Content-Type, then file_path extension
     const pathExt = filePath && filePath.includes('.') ? filePath.split('.').pop().toLowerCase() : null;
     const ctExt = extFromContentType(contentType);
-    const ext = (ctExt !== 'bin') ? ctExt : (pathExt || 'bin');
+    const ext = dbFormat || (ctExt !== 'bin' ? ctExt : (pathExt || 'bin'));
     const filenameBase = docId || file_id.slice(0, 16);
     const filename = `${filenameBase}.${ext}`;
     return new Response(imageResp.body, {
@@ -394,6 +422,161 @@ async function handleFileUrl(request, env) {
   return jsonResponse({ error: 'Failed to retrieve file URL' }, 502);
 }
 
+// ========== Route: /api/gallery/categories ==========
+
+function parseTags(prompt) {
+  if (!prompt) return [];
+  return prompt
+    .replace(/[()]/g, '')
+    .split(',')
+    .map(t => t.trim().toLowerCase())
+    .filter(t => t);
+}
+
+function jaccardSimilarity(setA, setB) {
+  if (setA.size === 0 && setB.size === 0) return 1;
+  let intersection = 0;
+  for (const item of setA) {
+    if (setB.has(item)) intersection++;
+  }
+  const union = setA.size + setB.size - intersection;
+  return union === 0 ? 0 : intersection / union;
+}
+
+async function handleCategories(request, env) {
+  if (request.method !== 'GET') {
+    return jsonResponse({ error: 'Method Not Allowed' }, 405);
+  }
+
+  const auth = (request.headers.get('authorization') || '').split(' ')[1];
+  const SECRET = env.JWT_SECRET || 'change-me';
+  try {
+    if (!auth) throw new Error('No token');
+    await jwtVerify(auth, SECRET);
+  } catch (e) {
+    return jsonResponse({ error: 'Unauthorized' }, 401);
+  }
+
+  const MONGO_URI = env.MONGO_URI;
+  if (!MONGO_URI) {
+    return jsonResponse({ error: 'MONGO_URI not configured' }, 500);
+  }
+
+  return withMongo(MONGO_URI, async (db) => {
+    const collection = db.collection('gallery');
+    const docs = await collection
+      .find({}, { projection: { prompt: 1, timestamp: 1 } })
+      .sort({ _id: -1 })
+      .toArray();
+
+    const THRESHOLD = 0.85;
+    const categories = [];
+
+    for (const doc of docs) {
+      const tags = parseTags(doc.prompt);
+      if (tags.length === 0) continue; // 跳过没有 prompt 的记录
+      const tagSet = new Set(tags);
+      let matched = false;
+
+      for (const cat of categories) {
+        if (jaccardSimilarity(tagSet, cat.tagSet) >= THRESHOLD) {
+          cat.items.push(doc._id.toString());
+          cat.count++;
+          matched = true;
+          break;
+        }
+      }
+
+      if (!matched) {
+        categories.push({
+          id: categories.length,
+          tags,
+          tagSet,
+          count: 1,
+          items: [doc._id.toString()],
+        });
+      }
+    }
+
+    const result = categories.map(({ tagSet, ...rest }) => rest);
+
+    return jsonResponse({
+      categories: result,
+      totalItems: docs.length,
+      totalCategories: categories.length,
+    }, 200, { 'Cache-Control': 'public, max-age=120' });
+  });
+}
+
+// ========== Route: /api/gallery/stats ==========
+
+async function handleStats(request, env) {
+  if (request.method !== 'GET') {
+    return jsonResponse({ error: 'Method Not Allowed' }, 405);
+  }
+
+  const auth = (request.headers.get('authorization') || '').split(' ')[1];
+  const SECRET = env.JWT_SECRET || 'change-me';
+  try {
+    if (!auth) throw new Error('No token');
+    await jwtVerify(auth, SECRET);
+  } catch (e) {
+    return jsonResponse({ error: 'Unauthorized' }, 401);
+  }
+
+  const MONGO_URI = env.MONGO_URI;
+  if (!MONGO_URI) {
+    return jsonResponse({ error: 'MONGO_URI not configured' }, 500);
+  }
+
+  return withMongo(MONGO_URI, async (db) => {
+    const collection = db.collection('gallery');
+    const docs = await collection
+      .find({}, { projection: { prompt: 1, metadata: 1, telegram: 1, timestamp: 1 } })
+      .sort({ _id: -1 })
+      .toArray();
+
+    const models = {};
+    let oldest = null;
+    let newest = null;
+
+    const items = docs.map((d) => {
+      const rawTs = d.timestamp;
+      // 统一转为 ISO 字符串进行比较
+      const ts = rawTs instanceof Date ? rawTs.toISOString() : (rawTs || null);
+      if (ts) {
+        if (!oldest || ts < oldest) oldest = ts;
+        if (!newest || ts > newest) newest = ts;
+      }
+      const model = d.metadata?.model || 'unknown';
+      models[model] = (models[model] || 0) + 1;
+
+      return {
+        id: d._id.toString(),
+        prompt: d.prompt,
+        metadata: d.metadata || {},
+        telegram: {
+          chat_id: d.telegram?.chat_id || null,
+          file_id: d.telegram?.file_id || null,
+          file_id_lossy: d.telegram?.file_id_lossy || null,
+          file_id_format: d.telegram?.file_id_format || null,
+          file_id_lossy_format: d.telegram?.file_id_lossy_format || null,
+          prev_file_id_format: d.telegram?.prev_file_id_format || null,
+        },
+        timestamp: ts,
+      };
+    });
+
+    return jsonResponse({
+      totalItems: docs.length,
+      oldestTimestamp: oldest,
+      newestTimestamp: newest,
+      models,
+      items,
+    }, 200, { 'Cache-Control': 'public, max-age=60' });
+  });
+}
+
 // ========== Main Worker ==========
 
 export default {
@@ -414,6 +597,12 @@ export default {
     }
     if (url.pathname === '/api/gallery') {
       return handleGallery(request, env);
+    }
+    if (url.pathname === '/api/gallery/categories') {
+      return handleCategories(request, env);
+    }
+    if (url.pathname === '/api/gallery/stats') {
+      return handleStats(request, env);
     }
     if (url.pathname === '/api/fileurl') {
       return handleFileUrl(request, env);
