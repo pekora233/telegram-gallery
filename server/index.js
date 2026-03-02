@@ -117,6 +117,118 @@ function extFromContentType(contentType) {
   return map[base] || 'bin';
 }
 
+const FILE_META_CACHE_TTL_MS = 10 * 60 * 1000;
+const FILE_PATH_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
+const FILE_META_CACHE_MAX_ITEMS = 2000;
+const FILE_PATH_CACHE_MAX_ITEMS = 4000;
+const fileMetaCache = new Map();
+const telegramPathCache = new Map();
+
+function getCachedValue(cache, key) {
+  const item = cache.get(key);
+  if (!item) return null;
+  if (item.expiresAt <= Date.now()) {
+    cache.delete(key);
+    return null;
+  }
+  return item.value;
+}
+
+function setCachedValue(cache, key, value, ttlMs, maxItems) {
+  cache.set(key, { value, expiresAt: Date.now() + ttlMs });
+  if (cache.size <= maxItems) return;
+
+  const overflow = cache.size - maxItems;
+  let removed = 0;
+  for (const oldestKey of cache.keys()) {
+    cache.delete(oldestKey);
+    removed += 1;
+    if (removed >= overflow) break;
+  }
+}
+
+function normalizeExt(ext) {
+  const value = String(ext || '').trim().toLowerCase().replace(/^\./, '');
+  if (!value) return null;
+  if (!/^[a-z0-9]{1,8}$/.test(value)) return null;
+  return value;
+}
+
+function extFromFilenameHint(filenameHint) {
+  if (!filenameHint) return null;
+  const idx = filenameHint.lastIndexOf('.');
+  if (idx < 0 || idx >= filenameHint.length - 1) return null;
+  return normalizeExt(filenameHint.slice(idx + 1));
+}
+
+async function resolveTelegramFilePath(botToken, fileId, useProxy = false) {
+  if (!botToken || !fileId) return null;
+  const cacheKey = `${useProxy ? 'proxy' : 'official'}:${botToken}:${fileId}`;
+  const cached = getCachedValue(telegramPathCache, cacheKey);
+  if (cached) return cached;
+
+  const base = useProxy ? TELEGRAM_PROXY : TELEGRAM_OFFICIAL;
+  const resp = await fetch(`${base}/bot${botToken}/getFile?file_id=${encodeURIComponent(fileId)}`);
+  if (!resp.ok) return null;
+  const data = await resp.json().catch(() => null);
+  const filePath = data?.result?.file_path || null;
+  if (!filePath) return null;
+
+  setCachedValue(
+    telegramPathCache,
+    cacheKey,
+    filePath,
+    FILE_PATH_CACHE_TTL_MS,
+    FILE_PATH_CACHE_MAX_ITEMS
+  );
+  return filePath;
+}
+
+async function lookupFileMetaFromDb(mongoUri, fileId) {
+  if (!mongoUri || !fileId) return null;
+  try {
+    return await withMongo(mongoUri, async (db) => {
+      const collection = db.collection('gallery');
+      const doc = await collection.findOne(
+        {
+          $or: [
+            { 'telegram.file_id': fileId },
+            { 'telegram.file_id_lossy': fileId },
+          ],
+        },
+        {
+          projection: {
+            _id: 1,
+            'telegram.bot_token': 1,
+            'telegram.file_id': 1,
+            'telegram.file_id_lossy': 1,
+            'telegram.file_id_format': 1,
+            'telegram.file_id_lossy_format': 1,
+          },
+        }
+      );
+      if (!doc) return null;
+
+      let dbFormat = null;
+      if (doc.telegram) {
+        if (fileId === doc.telegram.file_id && doc.telegram.file_id_format) {
+          dbFormat = doc.telegram.file_id_format;
+        } else if (fileId === doc.telegram.file_id_lossy && doc.telegram.file_id_lossy_format) {
+          dbFormat = doc.telegram.file_id_lossy_format;
+        }
+      }
+
+      return {
+        botToken: doc.telegram?.bot_token || null,
+        docId: doc._id?.toString() || null,
+        dbFormat: normalizeExt(dbFormat),
+      };
+    });
+  } catch (e) {
+    return null;
+  }
+}
+
 // ========== MongoDB helper ==========
 
 async function withMongo(mongoUri, fn) {
@@ -331,63 +443,60 @@ async function handleGallery(request, env) {
 
 // ========== Route: /api/fileurl ==========
 
-async function handleFileUrl(request, env) {
+async function handleFileUrl(request, env, ctx) {
   const url = new URL(request.url);
   const file_id = url.searchParams.get('file_id');
   if (!file_id) {
     return jsonResponse({ error: 'file_id required' }, 400);
   }
 
-  const MONGO_URI = env.MONGO_URI;
-  let botToken = env.BOT_TOKEN || null;
-  let docId = null;
-  let dbFormat = null;
+  const edgeCache = (request.method === 'GET' && typeof caches !== 'undefined' && caches.default)
+    ? caches.default
+    : null;
+  const edgeCacheKey = edgeCache
+    ? new Request(`${url.origin}/__edge_cache/file?file_id=${encodeURIComponent(file_id)}`, { method: 'GET' })
+    : null;
 
-  if (MONGO_URI) {
-    try {
-      const client = new MongoClient(MONGO_URI);
-      try {
-        await client.connect();
-        const db = client.db('magic_plugin_db');
-        const collection = db.collection('gallery');
-        const doc = await collection.findOne({
-          $or: [
-            { 'telegram.file_id': file_id },
-            { 'telegram.file_id_lossy': file_id },
-          ],
-        });
-        if (doc) {
-          if (doc.telegram && doc.telegram.bot_token) {
-            botToken = doc.telegram.bot_token;
-          }
-          docId = doc._id.toString();
-          // Determine format from DB based on which file_id matched
-          if (doc.telegram) {
-            if (file_id === doc.telegram.file_id && doc.telegram.file_id_format) {
-              dbFormat = doc.telegram.file_id_format;
-            } else if (file_id === doc.telegram.file_id_lossy && doc.telegram.file_id_lossy_format) {
-              dbFormat = doc.telegram.file_id_lossy_format;
-            }
-          }
-        }
-      } finally {
-        await client.close();
-      }
-    } catch (e) {
-      // fallback to env
+  if (edgeCache && edgeCacheKey) {
+    const cachedResponse = await edgeCache.match(edgeCacheKey);
+    if (cachedResponse) {
+      return cachedResponse;
     }
   }
 
+  const filenameHint = url.searchParams.get('filename_hint') || '';
+  const hintedExt = extFromFilenameHint(filenameHint);
+  const MONGO_URI = env.MONGO_URI;
+  const cachedMeta = getCachedValue(fileMetaCache, file_id);
+  let botToken = cachedMeta?.botToken || env.BOT_TOKEN || null;
+  let docId = cachedMeta?.docId || null;
+  let dbFormat = normalizeExt(cachedMeta?.dbFormat) || hintedExt;
+
+  async function loadDbMeta() {
+    const inMemory = getCachedValue(fileMetaCache, file_id);
+    if (inMemory) return inMemory;
+    const fromDb = await lookupFileMetaFromDb(MONGO_URI, file_id);
+    if (!fromDb) return null;
+    setCachedValue(fileMetaCache, file_id, fromDb, FILE_META_CACHE_TTL_MS, FILE_META_CACHE_MAX_ITEMS);
+    return fromDb;
+  }
+
   if (!botToken) {
-    return jsonResponse({ error: 'No bot token available' }, 500);
+    const dbMeta = await loadDbMeta();
+    botToken = dbMeta?.botToken || null;
+    docId = dbMeta?.docId || null;
+    dbFormat = normalizeExt(dbMeta?.dbFormat) || dbFormat;
+    if (!botToken) {
+      return jsonResponse({ error: 'No bot token available' }, 500);
+    }
   }
 
   function buildImageResponse(imageResp, filePath) {
     const contentType = imageResp.headers.get('content-type') || 'application/octet-stream';
     // Prefer format from DB, then Content-Type, then file_path extension
-    const pathExt = filePath && filePath.includes('.') ? filePath.split('.').pop().toLowerCase() : null;
+    const pathExt = normalizeExt(filePath && filePath.includes('.') ? filePath.split('.').pop() : null);
     const ctExt = extFromContentType(contentType);
-    const ext = dbFormat || (ctExt !== 'bin' ? ctExt : (pathExt || 'bin'));
+    const ext = normalizeExt(dbFormat) || hintedExt || (ctExt !== 'bin' ? ctExt : (pathExt || hintedExt || 'bin'));
     const filenameBase = docId || file_id.slice(0, 16);
     const filename = `${filenameBase}.${ext}`;
     return new Response(imageResp.body, {
@@ -396,43 +505,61 @@ async function handleFileUrl(request, env) {
         'Content-Type': contentType,
         'Content-Disposition': `inline; filename="${filename}"`,
         'Cache-Control': 'public, max-age=31536000, immutable',
+        'CDN-Cache-Control': 'public, max-age=31536000, immutable',
         ...corsHeaders(),
       },
     });
   }
 
-  // Try official getFile
-  try {
-    const resp = await fetch(`${TELEGRAM_OFFICIAL}/bot${botToken}/getFile?file_id=${encodeURIComponent(file_id)}`);
-    const data = await resp.json();
-    if (data && data.ok && data.result && data.result.file_path) {
-      const filePath = data.result.file_path;
-      const urlDirect = buildUrlFromFilePath(botToken, filePath, false);
-
-      const imageResp = await fetch(urlDirect);
-      if (imageResp.ok) {
-        return buildImageResponse(imageResp, filePath);
-      }
+  async function cacheAndReturn(response) {
+    if (!response || response.status !== 200 || !edgeCache || !edgeCacheKey) {
+      return response;
     }
-  } catch (e) {
-    // fallthrough to proxy
+
+    try {
+      const putPromise = edgeCache.put(edgeCacheKey, response.clone());
+      if (ctx && typeof ctx.waitUntil === 'function') {
+        ctx.waitUntil(putPromise);
+      } else {
+        await putPromise;
+      }
+    } catch (e) {
+      // ignore edge cache write failures and still serve origin response
+    }
+    return response;
   }
 
-  // Try proxy
-  try {
-    const resp2 = await fetch(`${TELEGRAM_PROXY}/bot${botToken}/getFile?file_id=${encodeURIComponent(file_id)}`);
-    const data2 = await resp2.json();
-    if (data2 && data2.ok && data2.result && data2.result.file_path) {
-      const filePath = data2.result.file_path;
-      const urlDirect = buildUrlFromFilePath(botToken, filePath, true);
+  async function fetchWithToken(token, useProxy = false) {
+    const filePath = await resolveTelegramFilePath(token, file_id, useProxy);
+    if (!filePath) return null;
 
-      const imageResp = await fetch(urlDirect);
-      if (imageResp.ok) {
-        return buildImageResponse(imageResp, filePath);
-      }
-    }
-  } catch (e) {
-    // final fallback
+    const urlDirect = buildUrlFromFilePath(token, filePath, useProxy);
+    const imageResp = await fetch(urlDirect).catch(() => null);
+    if (!imageResp || !imageResp.ok) return null;
+    return buildImageResponse(imageResp, filePath);
+  }
+
+  const triedTokens = new Set();
+  async function tryFetchWithToken(token) {
+    if (!token || triedTokens.has(token)) return null;
+    triedTokens.add(token);
+
+    let response = await fetchWithToken(token, false);
+    if (response) return response;
+    response = await fetchWithToken(token, true);
+    return response;
+  }
+
+  let imageResponse = await tryFetchWithToken(botToken);
+  if (imageResponse) return cacheAndReturn(imageResponse);
+
+  // env.BOT_TOKEN fails: try DB token as fallback (and cache it).
+  const dbMeta = await loadDbMeta();
+  if (dbMeta) {
+    docId = dbMeta.docId || docId;
+    dbFormat = normalizeExt(dbMeta.dbFormat) || dbFormat;
+    imageResponse = await tryFetchWithToken(dbMeta.botToken || botToken);
+    if (imageResponse) return cacheAndReturn(imageResponse);
   }
 
   return jsonResponse({ error: 'Failed to retrieve file URL' }, 502);
@@ -621,16 +748,20 @@ export default {
       return handleStats(request, env);
     }
     if (url.pathname === '/api/fileurl') {
-      return handleFileUrl(request, env);
+      return handleFileUrl(request, env, ctx);
     }
     // /api/file/<file_id>/<filename> — browser-friendly URL with proper filename
     if (url.pathname.startsWith('/api/file/')) {
       const segments = url.pathname.slice('/api/file/'.length).split('/');
       const fileId = decodeURIComponent(segments[0] || '');
+      const filenameHint = decodeURIComponent(segments[1] || '');
       if (fileId) {
         url.searchParams.set('file_id', fileId);
+        if (filenameHint) {
+          url.searchParams.set('filename_hint', filenameHint);
+        }
         const newReq = new Request(url.toString(), request);
-        return handleFileUrl(newReq, env);
+        return handleFileUrl(newReq, env, ctx);
       }
     }
     if (url.pathname.startsWith('/api/')) {

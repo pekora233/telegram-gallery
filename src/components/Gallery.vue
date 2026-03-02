@@ -25,7 +25,13 @@ const renderCount = ref(RENDER_BATCH);
 const paginationCursor = ref(null);
 const PAGE_SIZE = 60;
 const pendingImageLoads = new Set();
+const queuedImageFileIds = new Set();
+const imageLoadQueue = [];
+let activeImageLoadCount = 0;
+const MAX_CONCURRENT_IMAGE_LOADS = 4;
 const IMAGE_CACHE_MAX_ITEMS = 300;
+const TAG_PARSE_CACHE_MAX_ITEMS = 1500;
+const parsedTagCache = new Map();
 const ROOT_BACK_EXIT_WINDOW_MS = 1500;
 const DETAIL_AUTO_LOAD_THRESHOLD = 5;
 let lastRootBackAt = 0;
@@ -479,12 +485,9 @@ async function fetchGalleryPage(cursor = null, limit = PAGE_SIZE, sort = 'desc')
   };
 }
 
-async function loadEntryImage(entry) {
-  const fileId = getDisplayFileId(entry);
-  if (!fileId) return;
-  if (entry.src && !entry.loading) return;
+async function loadEntryImageNow(entry, fileId) {
+  if (!entry || !fileId) return;
   if (pendingImageLoads.has(fileId)) return;
-
   pendingImageLoads.add(fileId);
   try {
     // 优先从 IndexedDB 读取缓存的图片 blob
@@ -534,11 +537,42 @@ async function loadEntryImage(entry) {
   }
 }
 
+function pumpImageLoadQueue() {
+  while (activeImageLoadCount < MAX_CONCURRENT_IMAGE_LOADS && imageLoadQueue.length > 0) {
+    const task = imageLoadQueue.shift();
+    if (!task) break;
+
+    const { entry, fileId } = task;
+    queuedImageFileIds.delete(fileId);
+
+    if (!entry || !fileId) continue;
+    if (getDisplayFileId(entry) !== fileId) continue;
+    if (entry.src && !entry.loading) continue;
+
+    activeImageLoadCount += 1;
+    void loadEntryImageNow(entry, fileId).finally(() => {
+      activeImageLoadCount = Math.max(0, activeImageLoadCount - 1);
+      pumpImageLoadQueue();
+    });
+  }
+}
+
+function loadEntryImage(entry) {
+  const fileId = getDisplayFileId(entry);
+  if (!fileId) return;
+  if (entry.src && !entry.loading) return;
+  if (pendingImageLoads.has(fileId) || queuedImageFileIds.has(fileId)) return;
+
+  queuedImageFileIds.add(fileId);
+  imageLoadQueue.push({ entry, fileId });
+  pumpImageLoadQueue();
+}
+
 function queueImageLoads(targetEntries) {
   targetEntries.forEach((entry) => {
     if (!getDisplayFileId(entry)) return;
     if (entry.src && !entry.loading) return;
-    void loadEntryImage(entry);
+    loadEntryImage(entry);
   });
 }
 
@@ -966,11 +1000,29 @@ watch(selectedIndex, (index) => {
 // 解析 prompt 为 tags
 function parseTags(prompt) {
   if (!prompt) return [];
-  return prompt
+  if (parsedTagCache.has(prompt)) {
+    return parsedTagCache.get(prompt);
+  }
+
+  const tags = prompt
     .replace(/[()]/g, '')
     .split(',')
     .map(t => t.trim())
     .filter(t => t);
+
+  parsedTagCache.set(prompt, tags);
+  if (parsedTagCache.size > TAG_PARSE_CACHE_MAX_ITEMS) {
+    // Drop oldest cache entries to keep memory bounded.
+    const dropCount = Math.max(1, Math.floor(TAG_PARSE_CACHE_MAX_ITEMS * 0.2));
+    let dropped = 0;
+    for (const cacheKey of parsedTagCache.keys()) {
+      parsedTagCache.delete(cacheKey);
+      dropped += 1;
+      if (dropped >= dropCount) break;
+    }
+  }
+
+  return tags;
 }
 
 // 为 tag 生成颜色（淡色背景+深色文字+描边）- 64种配色
@@ -1065,6 +1117,13 @@ const columnCount = ref(5);
 
 const renderedEntries = computed(() => entries.value.slice(0, renderCount.value));
 const hasMoreToRender = computed(() => renderCount.value < entries.value.length);
+const entryTagsById = computed(() => {
+  const map = {};
+  renderedEntries.value.forEach((entry) => {
+    map[entry.id] = parseTags(entry.prompt);
+  });
+  return map;
+});
 
 const columns = computed(() => {
   const cols = Array.from({ length: columnCount.value }, () => []);
@@ -1087,6 +1146,11 @@ function updateColumnCount() {
   else if (width < 992) columnCount.value = 3;
   else if (width < 1200) columnCount.value = 4;
   else columnCount.value = 5;
+}
+
+function getEntryTags(entry) {
+  if (!entry || !entry.id) return [];
+  return entryTagsById.value[entry.id] || [];
 }
 
 function ensureHistoryGuard() {
@@ -1161,6 +1225,11 @@ onUnmounted(() => {
     renderMoreObserver.disconnect();
     renderMoreObserver = null;
   }
+  imageLoadQueue.length = 0;
+  queuedImageFileIds.clear();
+  pendingImageLoads.clear();
+  activeImageLoadCount = 0;
+  parsedTagCache.clear();
 });
 </script>
 
@@ -1503,9 +1572,9 @@ onUnmounted(() => {
               </div>
 
               <!-- 标签区域 -->
-              <div class="card-tags" v-if="entry.prompt && parseTags(entry.prompt).length > 0">
+              <div class="card-tags" v-if="entry.prompt && getEntryTags(entry).length > 0">
                 <span
-                  v-for="(tag, idx) in parseTags(entry.prompt).slice(0, 5)"
+                  v-for="(tag, idx) in getEntryTags(entry).slice(0, 5)"
                   :key="idx"
                   class="tag"
                   :style="{
@@ -1516,8 +1585,8 @@ onUnmounted(() => {
                 >
                   {{ tag }}
                 </span>
-                <span v-if="parseTags(entry.prompt).length > 5" class="tag-more">
-                  +{{ parseTags(entry.prompt).length - 5 }}
+                <span v-if="getEntryTags(entry).length > 5" class="tag-more">
+                  +{{ getEntryTags(entry).length - 5 }}
                 </span>
               </div>
             </div>
