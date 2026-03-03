@@ -342,9 +342,12 @@ async function handleGallery(request, env) {
     const url = new URL(request.url);
     const limitRaw = url.searchParams.get('limit');
     const cursorRaw = url.searchParams.get('cursor');
+    const pageRaw = url.searchParams.get('page');
+    const pageSizeRaw = url.searchParams.get('pageSize');
     const sortRaw = url.searchParams.get('sort');
     const cursor = typeof cursorRaw === 'string' ? cursorRaw.trim() : '';
     const ascending = sortRaw === 'asc';
+    const wantsNumberedPagination = pageRaw !== null || pageSizeRaw !== null;
     const wantsPagination = limitRaw !== null || Boolean(cursor);
     const decodeCursor = (rawCursor) => {
       if (!rawCursor) return null;
@@ -390,6 +393,44 @@ async function handleGallery(request, env) {
       },
       timestamp: d.timestamp instanceof Date ? d.timestamp.toISOString() : (d.timestamp || null),
     });
+
+    // Numbered pagination mode: /api/gallery?page=1&pageSize=60
+    if (wantsNumberedPagination) {
+      const parsedPage = parseInt(String(pageRaw ?? ''), 10);
+      const parsedPageSize = parseInt(String(pageSizeRaw ?? ''), 10);
+      const pageSize = Number.isFinite(parsedPageSize)
+        ? Math.max(1, Math.min(parsedPageSize, 200))
+        : 60;
+      const requestedPage = Number.isFinite(parsedPage)
+        ? Math.max(1, parsedPage)
+        : 1;
+
+      const totalCount = await collection.countDocuments({});
+      const totalPages = Math.max(1, Math.ceil(totalCount / pageSize));
+      const page = Math.min(requestedPage, totalPages);
+      const skip = (page - 1) * pageSize;
+      const sortDir = ascending ? 1 : -1;
+
+      const docs = await collection
+        .find({}, { projection: { prompt: 1, metadata: 1, telegram: 1, timestamp: 1 } })
+        .sort({ timestamp: sortDir })
+        .skip(skip)
+        .limit(pageSize)
+        .toArray();
+
+      return jsonResponse(
+        {
+          items: docs.map(toGalleryItem),
+          page,
+          pageSize,
+          totalCount,
+          totalPages,
+          hasMore: page < totalPages,
+        },
+        200,
+        { 'Cache-Control': 'public, max-age=30' }
+      );
+    }
 
     if (wantsPagination) {
       const parsedLimit = parseInt(String(limitRaw ?? ''), 10);

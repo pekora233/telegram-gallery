@@ -38,8 +38,15 @@ let lastRootBackAt = 0;
 let hasDetailHistoryState = false;
 let suppressNextPopstate = false;
 
-// 显示模式：desc（倒序/默认）、asc（正序）、categories（分类）
-const displayMode = ref(localStorage.getItem('gallery_display_mode') || 'desc');
+// 显示模式：desc（倒序/默认）、asc（正序）、pagination（分页）、categories（分类）
+const DISPLAY_MODES = new Set(['desc', 'asc', 'pagination', 'categories']);
+const savedDisplayMode = localStorage.getItem('gallery_display_mode');
+const displayMode = ref(DISPLAY_MODES.has(savedDisplayMode) ? savedDisplayMode : 'desc');
+const PAGINATION_VIEW_SIZE = 60;
+const paginationPage = ref(1);
+const paginationJumpInput = ref("");
+const paginationTotalCount = ref(0);
+const paginationTotalPages = ref(1);
 
 // 分类数据
 const categoriesData = ref([]);
@@ -485,6 +492,37 @@ async function fetchGalleryPage(cursor = null, limit = PAGE_SIZE, sort = 'desc')
   };
 }
 
+async function fetchGalleryNumberedPage(page = 1, pageSize = PAGINATION_VIEW_SIZE, sort = 'desc') {
+  const params = new URLSearchParams();
+  params.set('page', String(Math.max(1, Math.trunc(Number(page) || 1))));
+  params.set('pageSize', String(Math.max(1, Math.min(Math.trunc(Number(pageSize) || PAGINATION_VIEW_SIZE), 200))));
+  if (sort === 'asc') params.set('sort', 'asc');
+
+  const resp = await fetch(`/api/gallery?${params.toString()}`, {
+    headers: { Authorization: `Bearer ${token}` }
+  });
+
+  let body = null;
+  try {
+    body = await resp.json();
+  } catch (e) {
+    body = null;
+  }
+
+  if (!resp.ok) {
+    throw new Error(body?.error || 'Failed to load page');
+  }
+
+  return {
+    items: Array.isArray(body?.items) ? body.items : [],
+    page: Number.isFinite(Number(body?.page)) ? Math.max(1, Math.trunc(Number(body.page))) : 1,
+    pageSize: Number.isFinite(Number(body?.pageSize)) ? Math.max(1, Math.trunc(Number(body.pageSize))) : PAGINATION_VIEW_SIZE,
+    totalCount: Number.isFinite(Number(body?.totalCount)) ? Math.max(0, Math.trunc(Number(body.totalCount))) : 0,
+    totalPages: Number.isFinite(Number(body?.totalPages)) ? Math.max(1, Math.trunc(Number(body.totalPages))) : 1,
+    hasMore: Boolean(body?.hasMore),
+  };
+}
+
 async function loadEntryImageNow(entry, fileId) {
   if (!entry || !fileId) return;
   if (pendingImageLoads.has(fileId)) return;
@@ -601,15 +639,75 @@ function mergeTopPage(serverItems, forceImageRefresh = false, keepExistingTail =
   }
 
   setGalleryListCache(visibleServerList);
-  queueImageLoads(entries.value.slice(0, renderCount.value));
+  queueImageLoads(getVisibleEntriesForCurrentMode());
   syncSelectionWithEntries();
 }
 
+function getSortForMode(mode = displayMode.value) {
+  return mode === 'asc' ? 'asc' : 'desc';
+}
+
+function getVisibleEntriesForCurrentMode() {
+  if (displayMode.value === 'pagination') {
+    return entries.value;
+  }
+  return entries.value.slice(0, renderCount.value);
+}
+
+async function loadPaginationPage(targetPage = 1) {
+  error.value = "";
+  const resolvedPage = Math.max(1, Math.trunc(Number(targetPage) || 1));
+  const isInitialLoad = entries.value.length === 0;
+
+  if (isInitialLoad) {
+    loading.value = true;
+  } else {
+    loadingMore.value = true;
+  }
+
+  try {
+    const pageData = await fetchGalleryNumberedPage(resolvedPage, PAGINATION_VIEW_SIZE, 'desc');
+    const visibleServerList = pageData.items.filter((entry) => !pendingDeleteIds.has(entry.id));
+    const imageCache = getImageCache();
+    const existingById = new Map(entries.value.map((entry) => [entry.id, entry]));
+    entries.value = visibleServerList.map((entry) =>
+      buildEntryWithCache(entry, existingById.get(entry.id), imageCache, false)
+    );
+
+    paginationPage.value = pageData.page;
+    paginationTotalCount.value = pageData.totalCount;
+    paginationTotalPages.value = Math.max(1, pageData.totalPages);
+
+    paginationCursor.value = null;
+    hasMore.value = false;
+    renderCount.value = entries.value.length;
+
+    if (useIDB && pageData.items.length > 0) {
+      putItems(pageData.items).catch((e) =>
+        console.warn('Failed to cache numbered-page items in IDB:', e)
+      );
+    }
+
+    queueImageLoads(getVisibleEntriesForCurrentMode());
+    syncSelectionWithEntries();
+  } catch (e) {
+    error.value = String(e);
+  } finally {
+    loading.value = false;
+    loadingMore.value = false;
+  }
+}
+
 async function load(forceImageRefresh = false, forceListRefresh = false) {
+  if (displayMode.value === 'pagination') {
+    await loadPaginationPage(paginationPage.value || 1);
+    return;
+  }
+
   error.value = "";
   const hadEntries = entries.value.length > 0;
 
-  const currentSort = displayMode.value === 'asc' ? 'asc' : 'desc';
+  const currentSort = getSortForMode();
 
   if (!forceListRefresh && !hadEntries) {
     let cachedItems = null;
@@ -638,7 +736,7 @@ async function load(forceImageRefresh = false, forceListRefresh = false) {
         buildEntryWithCache(entry, null, imageCache, forceImageRefresh)
       );
       renderCount.value = RENDER_BATCH;
-      queueImageLoads(entries.value.slice(0, renderCount.value));
+      queueImageLoads(getVisibleEntriesForCurrentMode());
       loading.value = false;
     } else {
       loading.value = true;
@@ -679,12 +777,13 @@ async function load(forceImageRefresh = false, forceListRefresh = false) {
 }
 
 async function loadMore() {
+  if (displayMode.value === 'pagination') return;
   if (loading.value || loadingMore.value) return;
   if (!hasMore.value || !paginationCursor.value) return;
 
   loadingMore.value = true;
   try {
-    const currentSort = displayMode.value === 'asc' ? 'asc' : 'desc';
+    const currentSort = getSortForMode();
     const page = await fetchGalleryPage(paginationCursor.value, PAGE_SIZE, currentSort);
     const visibleItems = page.items.filter((entry) => !pendingDeleteIds.has(entry.id));
     const imageCache = getImageCache();
@@ -708,6 +807,9 @@ async function loadMore() {
       });
       entries.value = combined;
       syncSelectionWithEntries();
+      if (displayMode.value === 'pagination') {
+        queueImageLoads(getVisibleEntriesForCurrentMode());
+      }
     }
 
     paginationCursor.value = page.nextCursor;
@@ -757,6 +859,7 @@ function setupLoadMoreObserver() {
   loadMoreObserver = new IntersectionObserver(
     (observedEntries) => {
       if (observedEntries.some((item) => item.isIntersecting)) {
+        if (displayMode.value === 'pagination') return;
         void loadMore();
       }
     },
@@ -789,6 +892,7 @@ function setupRenderMoreObserver() {
   renderMoreObserver = new IntersectionObserver(
     (observedEntries) => {
       if (observedEntries.some((item) => item.isIntersecting)) {
+        if (displayMode.value === 'pagination') return;
         renderMore();
       }
     },
@@ -866,25 +970,62 @@ async function loadCategoryImage(itemId) {
 }
 
 function setDisplayMode(mode) {
+  if (!DISPLAY_MODES.has(mode)) return;
   if (displayMode.value === mode) return;
+
   const prevMode = displayMode.value;
+  const prevSort = getSortForMode(prevMode);
+  const nextSort = getSortForMode(mode);
+
   displayMode.value = mode;
   localStorage.setItem('gallery_display_mode', mode);
   renderCount.value = RENDER_BATCH;
 
   if (mode === 'categories') {
-    loadCategories();
-  } else if (prevMode === 'categories') {
-    // 从分类切回列表，不需要重新加载（entries 还在）
-  } else {
-    // asc <-> desc 切换，跳过 IDB 缓存直接从服务器加载
+    void loadCategories();
+    return;
+  }
+
+  if (mode === 'pagination') {
+    paginationPage.value = 1;
+    paginationJumpInput.value = "";
+    paginationTotalCount.value = 0;
+    paginationTotalPages.value = 1;
+    entries.value = [];
+    void loadPaginationPage(1);
+    return;
+  }
+
+  // Leaving pagination mode always switches back to the list query flow.
+  if (prevMode === 'pagination') {
     entries.value = [];
     paginationCursor.value = null;
     hasMore.value = true;
-    load(false, true);
+    paginationPage.value = 1;
+    paginationTotalCount.value = 0;
+    paginationTotalPages.value = 1;
+    paginationJumpInput.value = "";
+    void load(false, true);
+    return;
+  }
+
+  // Leaving categories mode always refreshes the list to match selected sort.
+  if (prevMode === 'categories') {
+    entries.value = [];
+    paginationCursor.value = null;
+    hasMore.value = true;
+    void load(false, true);
+    return;
+  }
+
+  if (prevSort !== nextSort) {
+    entries.value = [];
+    paginationCursor.value = null;
+    hasMore.value = true;
+    void load(false, true);
+    return;
   }
 }
-
 async function refreshSingleImage(entry) {
   const displayFileId = getDisplayFileId(entry);
   if (!displayFileId) return;
@@ -996,6 +1137,18 @@ function setSelectedImageIndex(index) {
 watch(selectedIndex, (index) => {
   maybeLoadMoreForDetail(index);
 });
+
+watch(
+  () => entries.value.length,
+  () => {
+    if (displayMode.value !== 'pagination') return;
+    const maxPage = loadedPaginationPages.value;
+    if (paginationPage.value > maxPage) {
+      paginationPage.value = maxPage;
+    }
+    queueImageLoads(getVisibleEntriesForCurrentMode());
+  }
+);
 
 // 解析 prompt 为 tags
 function parseTags(prompt) {
@@ -1115,8 +1268,44 @@ function getTagColor(tag) {
 // 瀑布流左右优先：将图片分配到多列
 const columnCount = ref(5);
 
-const renderedEntries = computed(() => entries.value.slice(0, renderCount.value));
-const hasMoreToRender = computed(() => renderCount.value < entries.value.length);
+const loadedPaginationPages = computed(() => Math.max(1, paginationTotalPages.value));
+const renderedEntries = computed(() => (
+  displayMode.value === 'pagination'
+    ? entries.value
+    : entries.value.slice(0, renderCount.value)
+));
+const hasMoreToRender = computed(() => (
+  displayMode.value === 'pagination'
+    ? false
+    : renderCount.value < entries.value.length
+));
+const canGoPrevPaginationPage = computed(() => paginationPage.value > 1);
+const canGoNextPaginationPage = computed(() => (
+  paginationPage.value < loadedPaginationPages.value
+));
+const isPaginationBusy = computed(() => loading.value || loadingMore.value);
+const visiblePaginationPages = computed(() => {
+  const total = loadedPaginationPages.value;
+  const current = Math.max(1, Math.min(paginationPage.value, total));
+  const pages = [];
+
+  if (total <= 11) {
+    for (let i = 1; i <= total; i += 1) pages.push(i);
+  } else {
+    pages.push(1);
+
+    const start = Math.max(2, current - 3);
+    const end = Math.min(total - 1, current + 3);
+
+    if (start > 2) pages.push("...");
+    for (let i = start; i <= end; i += 1) pages.push(i);
+    if (end < total - 1) pages.push("...");
+
+    pages.push(total);
+  }
+
+  return pages;
+});
 const entryTagsById = computed(() => {
   const map = {};
   renderedEntries.value.forEach((entry) => {
@@ -1137,6 +1326,22 @@ const columns = computed(() => {
 
   return cols;
 });
+
+async function goToPaginationPage(targetPage) {
+  const parsedTarget = Number(targetPage);
+  if (!Number.isFinite(parsedTarget)) return;
+  const nextPage = Math.max(1, Math.min(Math.trunc(parsedTarget), loadedPaginationPages.value));
+  if (nextPage === paginationPage.value) return;
+  await loadPaginationPage(nextPage);
+  window.scrollTo({ top: 0, behavior: 'smooth' });
+}
+
+async function submitPaginationJump() {
+  const target = Number.parseInt(String(paginationJumpInput.value).trim(), 10);
+  if (!Number.isFinite(target) || target < 1) return;
+  paginationJumpInput.value = "";
+  await goToPaginationPage(target);
+}
 
 // 响应式列数
 function updateColumnCount() {
@@ -1194,25 +1399,46 @@ function handlePopState() {
   handleRootBackPress();
 }
 
+function handleKeydown(e) {
+  if (displayMode.value !== 'pagination') return;
+  if (selectedIndex.value >= 0) return;
+  if (isPaginationBusy.value) return;
+  const tag = e.target?.tagName;
+  if (tag === 'INPUT' || tag === 'TEXTAREA') return;
+
+  if (e.key === 'ArrowLeft' && canGoPrevPaginationPage.value) {
+    e.preventDefault();
+    void goToPaginationPage(paginationPage.value - 1);
+  } else if (e.key === 'ArrowRight' && canGoNextPaginationPage.value) {
+    e.preventDefault();
+    void goToPaginationPage(paginationPage.value + 1);
+  }
+}
+
 onMounted(() => {
   ensureHistoryGuard();
-  load();
+  void load();
+  if (displayMode.value === 'categories') {
+    void loadCategories();
+  }
   updateColumnCount();
   window.addEventListener('resize', updateColumnCount);
   window.addEventListener('popstate', handlePopState);
+  window.addEventListener('keydown', handleKeydown);
   nextTick(() => {
     setupLoadMoreObserver();
     setupRenderMoreObserver();
   });
 
   pollTimer = setInterval(() => {
-    load(false, true);
+    void load(false, true);
   }, 60000);
 });
 
 onUnmounted(() => {
   window.removeEventListener('resize', updateColumnCount);
   window.removeEventListener('popstate', handlePopState);
+  window.removeEventListener('keydown', handleKeydown);
   if (pollTimer) {
     clearInterval(pollTimer);
     pollTimer = null;
@@ -1262,6 +1488,18 @@ onUnmounted(() => {
                 <polyline points="5 12 12 5 19 12"/>
               </svg>
               <span class="mode-label">正序</span>
+            </button>
+            <button
+              :class="['mode-btn', { active: displayMode === 'pagination' }]"
+              @click="setDisplayMode('pagination')"
+              title="分页显示"
+            >
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <rect x="3" y="4" width="18" height="16" rx="2"/>
+                <line x1="3" y1="10" x2="21" y2="10"/>
+                <line x1="9" y1="20" x2="9" y2="10"/>
+              </svg>
+              <span class="mode-label">分页</span>
             </button>
             <button
               :class="['mode-btn', { active: displayMode === 'categories' }]"
@@ -1517,6 +1755,84 @@ onUnmounted(() => {
 
       <!-- ====== 瀑布流模式（正序/倒序） ====== -->
       <template v-else>
+        <!-- 分页模式（顶部） -->
+        <div
+          v-if="displayMode === 'pagination' && !loading && entries.length > 0"
+          class="pagination-toolbar pagination-toolbar-top"
+        >
+          <div class="pagination-nav">
+            <button
+              class="pagination-btn pagination-icon-btn"
+              :disabled="!canGoPrevPaginationPage || isPaginationBusy"
+              @click="goToPaginationPage(1)"
+              title="首页"
+            >
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="11 17 6 12 11 7"/><polyline points="18 17 13 12 18 7"/></svg>
+            </button>
+            <button
+              class="pagination-btn pagination-icon-btn"
+              :disabled="!canGoPrevPaginationPage || isPaginationBusy"
+              @click="goToPaginationPage(paginationPage - 1)"
+              title="上一页"
+            >
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"/></svg>
+            </button>
+          </div>
+
+          <div class="pagination-pages" aria-label="分页页码">
+            <button
+              v-for="(pageToken, tokenIdx) in visiblePaginationPages"
+              :key="`page-top-${tokenIdx}-${pageToken}`"
+              :class="['pagination-btn', 'pagination-page-btn', { active: typeof pageToken === 'number' && pageToken === paginationPage }]"
+              :disabled="pageToken === '...' || isPaginationBusy"
+              @click="typeof pageToken === 'number' ? goToPaginationPage(pageToken) : null"
+            >
+              {{ pageToken }}
+            </button>
+          </div>
+
+          <span class="pagination-info-compact">{{ paginationPage }}<span class="pagination-sep">/</span>{{ loadedPaginationPages }}</span>
+
+          <div class="pagination-nav">
+            <button
+              class="pagination-btn pagination-icon-btn"
+              :disabled="!canGoNextPaginationPage || isPaginationBusy"
+              @click="goToPaginationPage(paginationPage + 1)"
+              title="下一页"
+            >
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"/></svg>
+            </button>
+            <button
+              class="pagination-btn pagination-icon-btn"
+              :disabled="!canGoNextPaginationPage || isPaginationBusy"
+              @click="goToPaginationPage(loadedPaginationPages)"
+              title="尾页"
+            >
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="13 17 18 12 13 7"/><polyline points="6 17 11 12 6 7"/></svg>
+            </button>
+          </div>
+
+          <div class="pagination-jump">
+            <input
+              v-model="paginationJumpInput"
+              class="pagination-jump-input"
+              type="number"
+              min="1"
+              step="1"
+              :placeholder="'跳至'"
+              :disabled="isPaginationBusy"
+              @keyup.enter="submitPaginationJump"
+            />
+            <button
+              class="pagination-btn pagination-jump-btn"
+              :disabled="isPaginationBusy"
+              @click="submitPaginationJump"
+            >
+              GO
+            </button>
+          </div>
+        </div>
+
         <!-- 瀑布流网格 -->
         <div class="gallery-grid" v-if="!loading">
           <div
@@ -1597,12 +1913,94 @@ onUnmounted(() => {
         <div
           ref="renderMoreAnchor"
           class="load-more-anchor"
-          v-show="!loading && hasMoreToRender"
+          v-show="displayMode !== 'pagination' && !loading && hasMoreToRender"
           aria-hidden="true"
         ></div>
 
-        <!-- 加载更多状态 -->
-        <div v-if="!loading && entries.length > 0" class="load-more-status">
+        <!-- 分页模式（底部） -->
+        <div
+          v-if="displayMode === 'pagination' && !loading && entries.length > 0"
+          class="pagination-toolbar pagination-toolbar-bottom"
+        >
+          <div class="pagination-nav">
+            <button
+              class="pagination-btn pagination-icon-btn"
+              :disabled="!canGoPrevPaginationPage || isPaginationBusy"
+              @click="goToPaginationPage(1)"
+              title="首页"
+            >
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="11 17 6 12 11 7"/><polyline points="18 17 13 12 18 7"/></svg>
+            </button>
+            <button
+              class="pagination-btn pagination-icon-btn"
+              :disabled="!canGoPrevPaginationPage || isPaginationBusy"
+              @click="goToPaginationPage(paginationPage - 1)"
+              title="上一页"
+            >
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"/></svg>
+            </button>
+          </div>
+
+          <div class="pagination-pages" aria-label="分页页码">
+            <button
+              v-for="(pageToken, tokenIdx) in visiblePaginationPages"
+              :key="`page-bottom-${tokenIdx}-${pageToken}`"
+              :class="['pagination-btn', 'pagination-page-btn', { active: typeof pageToken === 'number' && pageToken === paginationPage }]"
+              :disabled="pageToken === '...' || isPaginationBusy"
+              @click="typeof pageToken === 'number' ? goToPaginationPage(pageToken) : null"
+            >
+              {{ pageToken }}
+            </button>
+          </div>
+
+          <span class="pagination-info-compact">{{ paginationPage }}<span class="pagination-sep">/</span>{{ loadedPaginationPages }}</span>
+
+          <div class="pagination-nav">
+            <button
+              class="pagination-btn pagination-icon-btn"
+              :disabled="!canGoNextPaginationPage || isPaginationBusy"
+              @click="goToPaginationPage(paginationPage + 1)"
+              title="下一页"
+            >
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"/></svg>
+            </button>
+            <button
+              class="pagination-btn pagination-icon-btn"
+              :disabled="!canGoNextPaginationPage || isPaginationBusy"
+              @click="goToPaginationPage(loadedPaginationPages)"
+              title="尾页"
+            >
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="13 17 18 12 13 7"/><polyline points="6 17 11 12 6 7"/></svg>
+            </button>
+          </div>
+
+          <div class="pagination-jump">
+            <input
+              v-model="paginationJumpInput"
+              class="pagination-jump-input"
+              type="number"
+              min="1"
+              step="1"
+              :placeholder="'跳至'"
+              :disabled="isPaginationBusy"
+              @keyup.enter="submitPaginationJump"
+            />
+            <button
+              class="pagination-btn pagination-jump-btn"
+              :disabled="isPaginationBusy"
+              @click="submitPaginationJump"
+            >
+              GO
+            </button>
+          </div>
+        </div>
+
+        <div v-if="displayMode === 'pagination' && !loading && entries.length > 0" class="pagination-hint">
+          本页 {{ entries.length }} 条，全部 {{ paginationTotalCount }} 条（共 {{ paginationTotalPages }} 页）
+        </div>
+
+        <!-- 瀑布流模式加载状态 -->
+        <div v-if="displayMode !== 'pagination' && !loading && entries.length > 0" class="load-more-status">
           <div v-if="loadingMore" class="status-loading">
             <div class="mini-spinner"></div>
             <span>加载更多...</span>
@@ -1615,7 +2013,7 @@ onUnmounted(() => {
         <div
           ref="loadMoreAnchor"
           class="load-more-anchor"
-          v-show="!loading && hasMore && !hasMoreToRender && entries.length > 0"
+          v-show="displayMode !== 'pagination' && !loading && hasMore && !hasMoreToRender && entries.length > 0"
           aria-hidden="true"
         ></div>
 
@@ -2228,6 +2626,147 @@ onUnmounted(() => {
   color: var(--bg-primary);
 }
 
+/* 分页模式控制 */
+.pagination-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  padding: 0.5rem 0.75rem;
+  border: 1px solid var(--border-color);
+  border-radius: 0.75rem;
+  background: var(--bg-secondary);
+}
+
+.pagination-toolbar-top {
+  margin-bottom: 1rem;
+}
+
+.pagination-toolbar-bottom {
+  margin-top: 1.75rem;
+}
+
+.pagination-nav {
+  display: flex;
+  align-items: center;
+  gap: 0.25rem;
+}
+
+.pagination-pages {
+  display: flex;
+  align-items: center;
+  gap: 0.25rem;
+  flex-wrap: wrap;
+}
+
+.pagination-jump {
+  display: flex;
+  align-items: center;
+  gap: 0.375rem;
+}
+
+.pagination-btn {
+  border: 1px solid var(--border-color);
+  background: var(--bg-secondary);
+  color: var(--text-primary);
+  border-radius: 0.5rem;
+  padding: 0.4rem 0.625rem;
+  font-size: 0.813rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.2s;
+  white-space: nowrap;
+}
+
+.pagination-btn:hover:not(:disabled) {
+  background: var(--bg-tertiary);
+  border-color: var(--primary);
+}
+
+.pagination-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.pagination-icon-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0.4rem;
+  min-width: 2rem;
+  min-height: 2rem;
+}
+
+.pagination-icon-btn svg {
+  flex-shrink: 0;
+}
+
+.pagination-page-btn {
+  min-width: 2.1rem;
+  padding: 0.4rem 0.55rem;
+  text-align: center;
+}
+
+.pagination-page-btn.active {
+  border-color: var(--primary);
+  background: color-mix(in srgb, var(--primary) 12%, var(--bg-secondary));
+  color: var(--primary);
+}
+
+.pagination-info-compact {
+  display: none;
+  font-size: 0.875rem;
+  font-weight: 600;
+  color: var(--text-secondary);
+  white-space: nowrap;
+  padding: 0 0.25rem;
+}
+
+.pagination-info-compact .pagination-sep {
+  margin: 0 0.2em;
+  opacity: 0.5;
+}
+
+.pagination-jump-input {
+  width: 4rem;
+  border: 1px solid var(--border-color);
+  border-radius: 0.5rem;
+  padding: 0.4rem 0.5rem;
+  font-size: 0.813rem;
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
+  text-align: center;
+}
+
+.pagination-jump-input:focus {
+  outline: none;
+  border-color: var(--primary);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--primary) 22%, transparent);
+}
+
+.pagination-jump-input::-webkit-outer-spin-button,
+.pagination-jump-input::-webkit-inner-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+
+.pagination-jump-input[type=number] {
+  -moz-appearance: textfield;
+}
+
+.pagination-jump-btn {
+  font-weight: 700;
+  letter-spacing: 0.05em;
+}
+
+.pagination-hint {
+  margin-top: 0.75rem;
+  text-align: center;
+  color: var(--text-muted);
+  font-size: 0.813rem;
+}
+
 /* ========== 加载更多状态 ========== */
 .load-more-status {
   margin-top: 2rem;
@@ -2322,20 +2861,63 @@ onUnmounted(() => {
   .grid-column {
     gap: 0.75rem;
   }
+
+  .pagination-toolbar {
+    gap: 0.375rem;
+    padding: 0.5rem;
+  }
+
+  .pagination-pages {
+    display: none;
+  }
+
+  .pagination-info-compact {
+    display: inline;
+  }
+
+  .pagination-jump {
+    order: 4;
+  }
 }
 
 @media (max-width: 640px) {
   .header-right {
     gap: 0.375rem;
   }
-  
+
   .main-content {
     padding: 1rem 0.75rem 2rem;
   }
-  
+
   .batch-mode-banner {
     font-size: 0.813rem;
     padding: 0.75rem 1rem;
+  }
+
+  .pagination-toolbar {
+    gap: 0.3rem;
+    padding: 0.4rem;
+  }
+
+  .pagination-icon-btn {
+    min-width: 1.75rem;
+    min-height: 1.75rem;
+    padding: 0.3rem;
+  }
+
+  .pagination-info-compact {
+    font-size: 0.813rem;
+  }
+
+  .pagination-jump-input {
+    width: 3.5rem;
+    padding: 0.3rem 0.4rem;
+    font-size: 0.75rem;
+  }
+
+  .pagination-jump-btn {
+    padding: 0.3rem 0.5rem;
+    font-size: 0.75rem;
   }
 }
 
