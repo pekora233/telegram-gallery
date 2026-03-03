@@ -43,10 +43,16 @@ const DISPLAY_MODES = new Set(['desc', 'asc', 'pagination', 'categories']);
 const savedDisplayMode = localStorage.getItem('gallery_display_mode');
 const displayMode = ref(DISPLAY_MODES.has(savedDisplayMode) ? savedDisplayMode : 'desc');
 const PAGINATION_VIEW_SIZE = 60;
+const PAGINATION_PREFETCH_PAGES = 10;
 const paginationPage = ref(1);
 const paginationJumpInput = ref("");
 const paginationTotalCount = ref(0);
 const paginationTotalPages = ref(1);
+const paginationPageCache = new Map();
+const PAGINATION_CACHE_MAX_PAGES = 30;
+const paginationBatchRequests = new Map();
+let paginationBatchEndCursor = null;
+let paginationLastBatchEndPage = 0;
 
 // 分类数据
 const categoriesData = ref([]);
@@ -387,6 +393,11 @@ function restoreHiddenEntry(snapshot) {
 
 function finalizeDeleteSuccess(entry) {
   pendingDeleteIds.delete(entry.id);
+  if (displayMode.value === 'pagination') {
+    clearPaginationPageCache();
+    paginationTotalCount.value = Math.max(0, paginationTotalCount.value - 1);
+    paginationTotalPages.value = Math.max(1, Math.ceil(paginationTotalCount.value / PAGINATION_VIEW_SIZE));
+  }
   removeEntryFromLocalCache(entry);
   if (useIDB) {
     dbDeleteItem(entry.id).catch((e) =>
@@ -492,11 +503,57 @@ async function fetchGalleryPage(cursor = null, limit = PAGE_SIZE, sort = 'desc')
   };
 }
 
-async function fetchGalleryNumberedPage(page = 1, pageSize = PAGINATION_VIEW_SIZE, sort = 'desc') {
+function getPaginationBatchStart(page = 1, pageSpan = PAGINATION_PREFETCH_PAGES) {
+  const safePage = Math.max(1, Math.trunc(Number(page) || 1));
+  const safeSpan = Math.max(1, Math.trunc(Number(pageSpan) || 1));
+  return Math.floor((safePage - 1) / safeSpan) * safeSpan + 1;
+}
+
+function clearPaginationPageCache() {
+  paginationPageCache.clear();
+  paginationBatchRequests.clear();
+  paginationBatchEndCursor = null;
+  paginationLastBatchEndPage = 0;
+}
+
+function cachePaginationPages(pages = {}) {
+  if (!pages || typeof pages !== 'object') return;
+  Object.entries(pages).forEach(([pageToken, list]) => {
+    const pageNumber = Number.parseInt(pageToken, 10);
+    if (!Number.isFinite(pageNumber) || pageNumber < 1) return;
+    if (!Array.isArray(list)) return;
+    // LRU: delete first so re-insertion moves it to the end of the Map
+    paginationPageCache.delete(pageNumber);
+    paginationPageCache.set(pageNumber, list);
+  });
+  // Evict oldest entries if over limit
+  while (paginationPageCache.size > PAGINATION_CACHE_MAX_PAGES) {
+    const oldestKey = paginationPageCache.keys().next().value;
+    paginationPageCache.delete(oldestKey);
+  }
+}
+
+function hasCachedPaginationBatch(batchStartPage, pageSpan = PAGINATION_PREFETCH_PAGES, totalPages = paginationTotalPages.value) {
+  const safeStart = Math.max(1, Math.trunc(Number(batchStartPage) || 1));
+  const safeSpan = Math.max(1, Math.trunc(Number(pageSpan) || 1));
+  const safeTotal = Math.max(1, Math.trunc(Number(totalPages) || 1));
+  const endPage = Math.min(safeTotal, safeStart + safeSpan - 1);
+  for (let p = safeStart; p <= endPage; p += 1) {
+    if (!paginationPageCache.has(p)) return false;
+  }
+  return true;
+}
+
+async function fetchGalleryNumberedPage(page = 1, pageSize = PAGINATION_VIEW_SIZE, sort = 'desc', pageSpan = 1, batchCursor = null) {
+  const normalizedPage = Math.max(1, Math.trunc(Number(page) || 1));
+  const normalizedPageSize = Math.max(1, Math.min(Math.trunc(Number(pageSize) || PAGINATION_VIEW_SIZE), 200));
+  const normalizedSpan = Math.max(1, Math.min(Math.trunc(Number(pageSpan) || 1), 20));
   const params = new URLSearchParams();
-  params.set('page', String(Math.max(1, Math.trunc(Number(page) || 1))));
-  params.set('pageSize', String(Math.max(1, Math.min(Math.trunc(Number(pageSize) || PAGINATION_VIEW_SIZE), 200))));
+  params.set('page', String(normalizedPage));
+  params.set('pageSize', String(normalizedPageSize));
+  params.set('pageSpan', String(normalizedSpan));
   if (sort === 'asc') params.set('sort', 'asc');
+  if (batchCursor) params.set('batchCursor', batchCursor);
 
   const resp = await fetch(`/api/gallery?${params.toString()}`, {
     headers: { Authorization: `Bearer ${token}` }
@@ -513,14 +570,114 @@ async function fetchGalleryNumberedPage(page = 1, pageSize = PAGINATION_VIEW_SIZ
     throw new Error(body?.error || 'Failed to load page');
   }
 
+  const resolvedPage = Number.isFinite(Number(body?.page)) ? Math.max(1, Math.trunc(Number(body.page))) : normalizedPage;
+  const resolvedItems = Array.isArray(body?.items) ? body.items : [];
+  const pages = {};
+  if (body?.pages && typeof body.pages === 'object') {
+    Object.entries(body.pages).forEach(([pageToken, list]) => {
+      const pageNumber = Number.parseInt(pageToken, 10);
+      if (!Number.isFinite(pageNumber) || pageNumber < 1 || !Array.isArray(list)) return;
+      pages[pageNumber] = list;
+    });
+  }
+  if (!pages[resolvedPage]) {
+    pages[resolvedPage] = resolvedItems;
+  }
+
   return {
-    items: Array.isArray(body?.items) ? body.items : [],
-    page: Number.isFinite(Number(body?.page)) ? Math.max(1, Math.trunc(Number(body.page))) : 1,
-    pageSize: Number.isFinite(Number(body?.pageSize)) ? Math.max(1, Math.trunc(Number(body.pageSize))) : PAGINATION_VIEW_SIZE,
+    items: resolvedItems,
+    pages,
+    page: resolvedPage,
+    pageSize: Number.isFinite(Number(body?.pageSize)) ? Math.max(1, Math.trunc(Number(body.pageSize))) : normalizedPageSize,
+    pageSpan: Number.isFinite(Number(body?.pageSpan)) ? Math.max(1, Math.trunc(Number(body.pageSpan))) : normalizedSpan,
+    batchStartPage: Number.isFinite(Number(body?.batchStartPage))
+      ? Math.max(1, Math.trunc(Number(body.batchStartPage)))
+      : getPaginationBatchStart(resolvedPage, normalizedSpan),
+    batchEndPage: Number.isFinite(Number(body?.batchEndPage))
+      ? Math.max(1, Math.trunc(Number(body.batchEndPage)))
+      : resolvedPage,
+    batchEndCursor: body?.batchEndCursor || null,
     totalCount: Number.isFinite(Number(body?.totalCount)) ? Math.max(0, Math.trunc(Number(body.totalCount))) : 0,
     totalPages: Number.isFinite(Number(body?.totalPages)) ? Math.max(1, Math.trunc(Number(body.totalPages))) : 1,
     hasMore: Boolean(body?.hasMore),
   };
+}
+
+async function fetchGalleryNumberedBatch(page = 1, pageSize = PAGINATION_VIEW_SIZE, sort = 'desc', pageSpan = PAGINATION_PREFETCH_PAGES) {
+  const normalizedPage = Math.max(1, Math.trunc(Number(page) || 1));
+  const normalizedPageSize = Math.max(1, Math.min(Math.trunc(Number(pageSize) || PAGINATION_VIEW_SIZE), 200));
+  const normalizedSpan = Math.max(1, Math.min(Math.trunc(Number(pageSpan) || PAGINATION_PREFETCH_PAGES), 20));
+  const batchStartPage = getPaginationBatchStart(normalizedPage, normalizedSpan);
+  const cacheKey = `${sort}:${normalizedPageSize}:${normalizedSpan}:${batchStartPage}`;
+  const pendingRequest = paginationBatchRequests.get(cacheKey);
+  if (pendingRequest) return pendingRequest;
+
+  // Use cursor-based query when sequentially advancing to the next batch
+  // (i.e. this batch starts right after the previous batch ended).
+  // Otherwise fall back to skip-based pagination for random jumps.
+  let cursorToUse = null;
+  if (paginationBatchEndCursor && paginationLastBatchEndPage > 0 && batchStartPage === paginationLastBatchEndPage + 1) {
+    cursorToUse = paginationBatchEndCursor;
+  }
+
+  const request = fetchGalleryNumberedPage(normalizedPage, normalizedPageSize, sort, normalizedSpan, cursorToUse)
+    .then((result) => {
+      // Store the endCursor and endPage from this batch for the next sequential fetch
+      if (result.batchEndCursor) {
+        paginationBatchEndCursor = result.batchEndCursor;
+      }
+      if (Number.isFinite(result.batchEndPage)) {
+        paginationLastBatchEndPage = result.batchEndPage;
+      }
+      return result;
+    })
+    .finally(() => {
+      paginationBatchRequests.delete(cacheKey);
+    });
+  paginationBatchRequests.set(cacheKey, request);
+  return request;
+}
+
+async function prefetchPaginationAhead(currentPage = paginationPage.value) {
+  if (displayMode.value !== 'pagination') return;
+  const totalPages = Math.max(1, Math.trunc(Number(paginationTotalPages.value) || 1));
+  const page = Math.max(1, Math.min(Math.trunc(Number(currentPage) || 1), totalPages));
+  const batchStart = getPaginationBatchStart(page, PAGINATION_PREFETCH_PAGES);
+  const prefetchThreshold = batchStart + Math.floor(PAGINATION_PREFETCH_PAGES / 2) - 1;
+  if (page < prefetchThreshold) return;
+
+  const nextBatchStart = batchStart + PAGINATION_PREFETCH_PAGES;
+  if (nextBatchStart > totalPages) return;
+  if (hasCachedPaginationBatch(nextBatchStart, PAGINATION_PREFETCH_PAGES, totalPages)) return;
+
+  try {
+    const batchData = await fetchGalleryNumberedBatch(
+      nextBatchStart,
+      PAGINATION_VIEW_SIZE,
+      'desc',
+      PAGINATION_PREFETCH_PAGES
+    );
+    cachePaginationPages(batchData.pages);
+    cachePaginationPages({ [batchData.page]: batchData.items });
+    if (Number.isFinite(Number(batchData.totalCount))) {
+      paginationTotalCount.value = Math.max(0, Math.trunc(Number(batchData.totalCount)));
+    }
+    if (Number.isFinite(Number(batchData.totalPages))) {
+      paginationTotalPages.value = Math.max(1, Math.trunc(Number(batchData.totalPages)));
+    }
+
+    const fetchedBatchItems = Object.values(batchData.pages || {})
+      .filter((list) => Array.isArray(list))
+      .flat();
+    if (useIDB && fetchedBatchItems.length > 0) {
+      putItems(fetchedBatchItems).catch((e) =>
+        console.warn('Failed to cache prefetched pagination items in IDB:', e)
+      );
+    }
+  } catch (e) {
+    // Prefetch is best-effort and should not affect current page UX.
+    console.warn('Pagination prefetch failed:', e);
+  }
 }
 
 async function loadEntryImageNow(entry, fileId) {
@@ -654,9 +811,37 @@ function getVisibleEntriesForCurrentMode() {
   return entries.value.slice(0, renderCount.value);
 }
 
-async function loadPaginationPage(targetPage = 1) {
+async function loadPaginationPage(targetPage = 1, options = {}) {
   error.value = "";
   const resolvedPage = Math.max(1, Math.trunc(Number(targetPage) || 1));
+  const forceRefresh = Boolean(options?.forceRefresh);
+  if (forceRefresh) {
+    clearPaginationPageCache();
+  }
+
+  if (!forceRefresh) {
+    const cachedItems = paginationPageCache.get(resolvedPage);
+    if (Array.isArray(cachedItems)) {
+      // LRU: move accessed page to the end
+      paginationPageCache.delete(resolvedPage);
+      paginationPageCache.set(resolvedPage, cachedItems);
+      const visibleServerList = cachedItems.filter((entry) => !pendingDeleteIds.has(entry.id));
+      const imageCache = getImageCache();
+      const existingById = new Map(entries.value.map((entry) => [entry.id, entry]));
+      entries.value = visibleServerList.map((entry) =>
+        buildEntryWithCache(entry, existingById.get(entry.id), imageCache, false)
+      );
+      paginationPage.value = resolvedPage;
+      paginationCursor.value = null;
+      hasMore.value = false;
+      renderCount.value = entries.value.length;
+      queueImageLoads(getVisibleEntriesForCurrentMode());
+      syncSelectionWithEntries();
+      void prefetchPaginationAhead(resolvedPage);
+      return;
+    }
+  }
+
   const isInitialLoad = entries.value.length === 0;
 
   if (isInitialLoad) {
@@ -666,8 +851,17 @@ async function loadPaginationPage(targetPage = 1) {
   }
 
   try {
-    const pageData = await fetchGalleryNumberedPage(resolvedPage, PAGINATION_VIEW_SIZE, 'desc');
-    const visibleServerList = pageData.items.filter((entry) => !pendingDeleteIds.has(entry.id));
+    const pageData = await fetchGalleryNumberedBatch(
+      resolvedPage,
+      PAGINATION_VIEW_SIZE,
+      'desc',
+      PAGINATION_PREFETCH_PAGES
+    );
+    cachePaginationPages(pageData.pages);
+    cachePaginationPages({ [pageData.page]: pageData.items });
+
+    const currentItems = paginationPageCache.get(pageData.page) || pageData.items;
+    const visibleServerList = currentItems.filter((entry) => !pendingDeleteIds.has(entry.id));
     const imageCache = getImageCache();
     const existingById = new Map(entries.value.map((entry) => [entry.id, entry]));
     entries.value = visibleServerList.map((entry) =>
@@ -682,14 +876,18 @@ async function loadPaginationPage(targetPage = 1) {
     hasMore.value = false;
     renderCount.value = entries.value.length;
 
-    if (useIDB && pageData.items.length > 0) {
-      putItems(pageData.items).catch((e) =>
+    const fetchedBatchItems = Object.values(pageData.pages || {})
+      .filter((list) => Array.isArray(list))
+      .flat();
+    if (useIDB && fetchedBatchItems.length > 0) {
+      putItems(fetchedBatchItems).catch((e) =>
         console.warn('Failed to cache numbered-page items in IDB:', e)
       );
     }
 
     queueImageLoads(getVisibleEntriesForCurrentMode());
     syncSelectionWithEntries();
+    void prefetchPaginationAhead(pageData.page);
   } catch (e) {
     error.value = String(e);
   } finally {
@@ -700,7 +898,7 @@ async function loadPaginationPage(targetPage = 1) {
 
 async function load(forceImageRefresh = false, forceListRefresh = false) {
   if (displayMode.value === 'pagination') {
-    await loadPaginationPage(paginationPage.value || 1);
+    await loadPaginationPage(paginationPage.value || 1, { forceRefresh: forceListRefresh });
     return;
   }
 
@@ -987,6 +1185,7 @@ function setDisplayMode(mode) {
   }
 
   if (mode === 'pagination') {
+    clearPaginationPageCache();
     paginationPage.value = 1;
     paginationJumpInput.value = "";
     paginationTotalCount.value = 0;
@@ -998,6 +1197,7 @@ function setDisplayMode(mode) {
 
   // Leaving pagination mode always switches back to the list query flow.
   if (prevMode === 'pagination') {
+    clearPaginationPageCache();
     entries.value = [];
     paginationCursor.value = null;
     hasMore.value = true;
@@ -1066,6 +1266,7 @@ async function performClearCache() {
   showClearCacheModal.value = false;
   try {
     clearLocalStorageCaches();
+    clearPaginationPageCache();
 
     // 清除 IndexedDB 所有数据（图片缓存 + 元数据缓存）
     if (useIDB) {
@@ -1456,6 +1657,7 @@ onUnmounted(() => {
   pendingImageLoads.clear();
   activeImageLoadCount = 0;
   parsedTagCache.clear();
+  clearPaginationPageCache();
 });
 </script>
 

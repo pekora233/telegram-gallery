@@ -231,15 +231,23 @@ async function lookupFileMetaFromDb(mongoUri, fileId) {
 
 // ========== MongoDB helper ==========
 
-async function withMongo(mongoUri, fn) {
-  const client = new MongoClient(mongoUri);
-  try {
-    await client.connect();
-    const db = client.db('magic_plugin_db');
-    return await fn(db);
-  } finally {
-    await client.close();
+let _cachedClient = null;
+let _cachedClientUri = null;
+
+function getMongoClient(mongoUri) {
+  if (_cachedClient && _cachedClientUri === mongoUri) {
+    return _cachedClient;
   }
+  _cachedClient = new MongoClient(mongoUri);
+  _cachedClientUri = mongoUri;
+  return _cachedClient;
+}
+
+async function withMongo(mongoUri, fn) {
+  const client = getMongoClient(mongoUri);
+  await client.connect(); // no-op if already connected
+  const db = client.db('magic_plugin_db');
+  return await fn(db);
 }
 
 // ========== CORS headers ==========
@@ -345,6 +353,8 @@ async function handleGallery(request, env) {
     const pageRaw = url.searchParams.get('page');
     const pageSizeRaw = url.searchParams.get('pageSize');
     const sortRaw = url.searchParams.get('sort');
+    const pageSpanRaw = url.searchParams.get('pageSpan');
+    const batchCursorRaw = url.searchParams.get('batchCursor');
     const cursor = typeof cursorRaw === 'string' ? cursorRaw.trim() : '';
     const ascending = sortRaw === 'asc';
     const wantsNumberedPagination = pageRaw !== null || pageSizeRaw !== null;
@@ -398,31 +408,70 @@ async function handleGallery(request, env) {
     if (wantsNumberedPagination) {
       const parsedPage = parseInt(String(pageRaw ?? ''), 10);
       const parsedPageSize = parseInt(String(pageSizeRaw ?? ''), 10);
+      const parsedPageSpan = parseInt(String(pageSpanRaw ?? ''), 10);
       const pageSize = Number.isFinite(parsedPageSize)
         ? Math.max(1, Math.min(parsedPageSize, 200))
         : 60;
+      const pageSpan = Number.isFinite(parsedPageSpan)
+        ? Math.max(1, Math.min(parsedPageSpan, 20))
+        : 1;
       const requestedPage = Number.isFinite(parsedPage)
         ? Math.max(1, parsedPage)
         : 1;
 
-      const totalCount = await collection.countDocuments({});
+      const totalCount = await collection.estimatedDocumentCount();
       const totalPages = Math.max(1, Math.ceil(totalCount / pageSize));
       const page = Math.min(requestedPage, totalPages);
-      const skip = (page - 1) * pageSize;
+      const batchStartPage = Math.floor((page - 1) / pageSpan) * pageSpan + 1;
+      const batchEndPage = Math.min(totalPages, batchStartPage + pageSpan - 1);
+      const batchLimit = (batchEndPage - batchStartPage + 1) * pageSize;
       const sortDir = ascending ? 1 : -1;
 
-      const docs = await collection
-        .find({}, { projection: { prompt: 1, metadata: 1, telegram: 1, timestamp: 1 } })
-        .sort({ timestamp: sortDir })
-        .skip(skip)
-        .limit(pageSize)
-        .toArray();
+      // If batchCursor is provided, use cursor-based query (avoids O(n) skip).
+      // Otherwise fall back to skip() for random page jumps.
+      const batchCursor = typeof batchCursorRaw === 'string' ? batchCursorRaw.trim() : '';
+      let docs;
+      if (batchCursor) {
+        const cursorValue = decodeCursor(batchCursor);
+        const op = ascending ? '$gt' : '$lt';
+        docs = await collection
+          .find({ timestamp: { [op]: cursorValue } }, { projection: { prompt: 1, metadata: 1, telegram: 1, timestamp: 1 } })
+          .sort({ timestamp: sortDir })
+          .limit(batchLimit)
+          .toArray();
+      } else {
+        const skip = (batchStartPage - 1) * pageSize;
+        docs = await collection
+          .find({}, { projection: { prompt: 1, metadata: 1, telegram: 1, timestamp: 1 } })
+          .sort({ timestamp: sortDir })
+          .skip(skip)
+          .limit(batchLimit)
+          .toArray();
+      }
+
+      const mappedItems = docs.map(toGalleryItem);
+      const pages = {};
+      for (let p = batchStartPage; p <= batchEndPage; p += 1) {
+        const pageOffset = (p - batchStartPage) * pageSize;
+        pages[String(p)] = mappedItems.slice(pageOffset, pageOffset + pageSize);
+      }
+      const items = pages[String(page)] || [];
+
+      // Provide cursor of the last doc in this batch so the frontend can
+      // use cursor-based navigation for the next sequential batch.
+      const lastDoc = docs[docs.length - 1];
+      const batchEndCursor = lastDoc ? encodeCursor(lastDoc.timestamp) : null;
 
       return jsonResponse(
         {
-          items: docs.map(toGalleryItem),
+          items,
+          pages,
           page,
           pageSize,
+          pageSpan,
+          batchStartPage,
+          batchEndPage,
+          batchEndCursor,
           totalCount,
           totalPages,
           hasMore: page < totalPages,
