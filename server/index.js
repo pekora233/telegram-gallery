@@ -117,8 +117,11 @@ function extFromContentType(contentType) {
   return map[base] || 'bin';
 }
 
+const FILE_META_CACHE_TTL_MS = 10 * 60 * 1000;
 const FILE_PATH_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
+const FILE_META_CACHE_MAX_ITEMS = 2000;
 const FILE_PATH_CACHE_MAX_ITEMS = 4000;
+const fileMetaCache = new Map();
 const telegramPathCache = new Map();
 
 function getCachedValue(cache, key) {
@@ -156,6 +159,14 @@ function extFromFilenameHint(filenameHint) {
   const idx = filenameHint.lastIndexOf('.');
   if (idx < 0 || idx >= filenameHint.length - 1) return null;
   return normalizeExt(filenameHint.slice(idx + 1));
+}
+
+function parseBotTokenList(raw) {
+  if (!raw) return [];
+  return String(raw)
+    .split(/[\n,\s]+/)
+    .map((token) => token.trim())
+    .filter(Boolean);
 }
 
 const FETCH_TIMEOUT_MS = 8000;
@@ -196,6 +207,51 @@ async function resolveTelegramFilePath(botToken, fileId, useProxy = false) {
   }
 }
 
+async function lookupFileMetaFromDb(mongoUri, fileId) {
+  if (!mongoUri || !fileId) return null;
+  try {
+    return await withMongo(mongoUri, async (db) => {
+      const collection = db.collection('gallery');
+      const doc = await collection.findOne(
+        {
+          $or: [
+            { 'telegram.file_id': fileId },
+            { 'telegram.file_id_lossy': fileId },
+          ],
+        },
+        {
+          projection: {
+            _id: 1,
+            'telegram.bot_token': 1,
+            'telegram.file_id': 1,
+            'telegram.file_id_lossy': 1,
+            'telegram.file_id_format': 1,
+            'telegram.file_id_lossy_format': 1,
+          },
+        }
+      );
+      if (!doc) return null;
+
+      let dbFormat = null;
+      if (doc.telegram) {
+        if (fileId === doc.telegram.file_id && doc.telegram.file_id_format) {
+          dbFormat = doc.telegram.file_id_format;
+        } else if (fileId === doc.telegram.file_id_lossy && doc.telegram.file_id_lossy_format) {
+          dbFormat = doc.telegram.file_id_lossy_format;
+        }
+      }
+
+      return {
+        botToken: doc.telegram?.bot_token || null,
+        docId: doc._id?.toString() || null,
+        dbFormat: normalizeExt(dbFormat),
+      };
+    });
+  } catch (e) {
+    return null;
+  }
+}
+
 // ========== MongoDB helper ==========
 
 const MONGO_CONNECT_TIMEOUT_MS = 5000;
@@ -212,6 +268,9 @@ async function withMongo(mongoUri, fn) {
     connectTimeoutMS: MONGO_CONNECT_TIMEOUT_MS,
     socketTimeoutMS: MONGO_SOCKET_TIMEOUT_MS,
     serverSelectionTimeoutMS: MONGO_SERVER_SELECTION_TIMEOUT_MS,
+    maxPoolSize: 1,
+    minPoolSize: 0,
+    maxIdleTimeMS: 10000,
   });
   try {
     await client.connect();
@@ -225,12 +284,13 @@ async function withMongo(mongoUri, fn) {
 
 // Race any promise against a timeout — prevents Worker hangs.
 function withTimeout(promise, ms, label = 'Operation') {
-  return Promise.race([
-    promise,
-    new Promise((_, reject) =>
-      setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms)
-    ),
-  ]);
+  let timer = null;
+  const timeoutPromise = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+  });
+  return Promise.race([promise, timeoutPromise]).finally(() => {
+    if (timer !== null) clearTimeout(timer);
+  });
 }
 
 // ========== CORS headers ==========
@@ -536,13 +596,40 @@ async function handleFileUrl(request, env, ctx) {
     if (cachedResponse) return cachedResponse;
   }
 
-  // --- Resolve metadata (NO MongoDB — purely from env + URL hints) ---
+  // --- Resolve metadata (lazy DB fallback) ---
   const filenameHint = url.searchParams.get('filename_hint') || '';
   const hintedExt = extFromFilenameHint(filenameHint);
-  const botToken = env.BOT_TOKEN || null;
-  const dbFormat = hintedExt;
+  const MONGO_URI = env.MONGO_URI || null;
+  const envTokens = [
+    ...parseBotTokenList(env.BOT_TOKENS),
+    ...parseBotTokenList(env.BOT_TOKEN),
+  ];
+  let dbMeta = getCachedValue(fileMetaCache, file_id) || null;
+  let dbFormat = normalizeExt(dbMeta?.dbFormat) || hintedExt;
+  let docId = dbMeta?.docId || null;
+  const triedTokens = new Set();
 
-  if (!botToken) {
+  const readDbMeta = async () => {
+    if (!MONGO_URI || dbMeta) return;
+    dbMeta = await lookupFileMetaFromDb(MONGO_URI, file_id);
+    if (dbMeta) {
+      setCachedValue(fileMetaCache, file_id, dbMeta, FILE_META_CACHE_TTL_MS, FILE_META_CACHE_MAX_ITEMS);
+      dbFormat = normalizeExt(dbMeta.dbFormat) || hintedExt;
+      docId = dbMeta.docId || null;
+    }
+  };
+
+  // If env has no token configured, load DB meta immediately.
+  if (envTokens.length === 0) {
+    await readDbMeta();
+  }
+
+  const buildCandidateTokens = () => [...new Set([
+    ...envTokens,
+    dbMeta?.botToken || null,
+  ].filter(Boolean))];
+
+  if (buildCandidateTokens().length === 0) {
     return jsonResponse({ error: 'No bot token available' }, 500);
   }
 
@@ -552,7 +639,7 @@ async function handleFileUrl(request, env, ctx) {
     const pathExt = normalizeExt(filePath && filePath.includes('.') ? filePath.split('.').pop() : null);
     const ctExt = extFromContentType(contentType);
     const ext = normalizeExt(dbFormat) || hintedExt || (ctExt !== 'bin' ? ctExt : (pathExt || hintedExt || 'bin'));
-    const filenameBase = file_id.slice(0, 16);
+    const filenameBase = docId || file_id.slice(0, 16);
     const filename = `${filenameBase}.${ext}`;
     return new Response(imageResp.body, {
       status: 200,
@@ -576,15 +663,7 @@ async function handleFileUrl(request, env, ctx) {
     return buildImageResponse(imageResp, filePath);
   }
 
-  // --- Try official & proxy in parallel (single token, no MongoDB lookup) ---
-  const [officialResult, proxyResult] = await Promise.allSettled([
-    tryFetch(botToken, false),
-    tryFetch(botToken, true),
-  ]);
-
-  const response = officialResult.value || proxyResult.value;
-  if (response) {
-    // Write to edge cache in background
+  function commitResponse(response) {
     if (edgeCache && edgeCacheKey) {
       try {
         const putPromise = edgeCache.put(edgeCacheKey, response.clone());
@@ -594,6 +673,31 @@ async function handleFileUrl(request, env, ctx) {
       } catch (e) { /* ignore */ }
     }
     return response;
+  }
+
+  async function tryTokens(tokens) {
+    for (const token of tokens) {
+      if (triedTokens.has(token)) continue;
+      triedTokens.add(token);
+      const [officialResult, proxyResult] = await Promise.allSettled([
+        tryFetch(token, false),
+        tryFetch(token, true),
+      ]);
+
+      const response = officialResult.value || proxyResult.value;
+      if (response) return response;
+    }
+    return null;
+  }
+
+  let response = await tryTokens(buildCandidateTokens());
+  if (response) return commitResponse(response);
+
+  // Only hit MongoDB if env tokens failed.
+  if (!dbMeta) {
+    await readDbMeta();
+    response = await tryTokens(buildCandidateTokens());
+    if (response) return commitResponse(response);
   }
 
   return jsonResponse({ error: 'Failed to retrieve file URL' }, 502);
