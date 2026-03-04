@@ -66,7 +66,14 @@ const savedDisplayMode = localStorage.getItem('gallery_display_mode');
 const displayMode = ref(DISPLAY_MODES.has(savedDisplayMode) ? savedDisplayMode : 'desc');
 const PAGINATION_VIEW_SIZE = 60;
 const PAGINATION_PREFETCH_PAGES = 10;
-const paginationPage = ref(1);
+const PAGINATION_PAGE_KEY = 'gallery_pagination_page';
+function readSavedPaginationPage() {
+  try {
+    const v = parseInt(localStorage.getItem(PAGINATION_PAGE_KEY), 10);
+    return Number.isFinite(v) && v >= 1 ? v : 1;
+  } catch { return 1; }
+}
+const paginationPage = ref(readSavedPaginationPage());
 const paginationJumpInput = ref("");
 const paginationTotalCount = ref(0);
 const paginationTotalPages = ref(1);
@@ -1218,12 +1225,13 @@ function setDisplayMode(mode) {
 
   if (mode === 'pagination') {
     clearPaginationPageCache();
-    paginationPage.value = 1;
+    const restoredPage = readSavedPaginationPage();
+    paginationPage.value = restoredPage;
     paginationJumpInput.value = "";
     paginationTotalCount.value = 0;
     paginationTotalPages.value = 1;
     entries.value = [];
-    void loadPaginationPage(1);
+    void loadPaginationPage(restoredPage);
     return;
   }
 
@@ -1382,6 +1390,14 @@ watch(
     queueImageLoads(getVisibleEntriesForCurrentMode());
   }
 );
+
+watch(paginationPage, (page) => {
+  try {
+    if (displayMode.value === 'pagination' && Number.isFinite(page) && page >= 1) {
+      localStorage.setItem(PAGINATION_PAGE_KEY, String(page));
+    }
+  } catch { /* ignore */ }
+});
 
 // 解析 prompt 为 tags
 function parseTags(prompt) {
