@@ -827,6 +827,7 @@ async function handleStats(request, env) {
 
 export default {
   async fetch(request, env, ctx) {
+    try {
     const url = new URL(request.url);
 
     // CORS preflight
@@ -873,5 +874,9 @@ export default {
 
     // Non-API routes are handled by the assets (SPA)
     return new Response(null, { status: 404 });
+    } catch (e) {
+      console.error('Unhandled worker error:', e);
+      return jsonResponse({ error: 'Internal Server Error', message: String(e?.message || e) }, 500);
+    }
   },
 };
