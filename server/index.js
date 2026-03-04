@@ -117,11 +117,8 @@ function extFromContentType(contentType) {
   return map[base] || 'bin';
 }
 
-const FILE_META_CACHE_TTL_MS = 10 * 60 * 1000;
 const FILE_PATH_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
-const FILE_META_CACHE_MAX_ITEMS = 2000;
 const FILE_PATH_CACHE_MAX_ITEMS = 4000;
-const fileMetaCache = new Map();
 const telegramPathCache = new Map();
 
 function getCachedValue(cache, key) {
@@ -199,96 +196,41 @@ async function resolveTelegramFilePath(botToken, fileId, useProxy = false) {
   }
 }
 
-async function lookupFileMetaFromDb(mongoUri, fileId) {
-  if (!mongoUri || !fileId) return null;
-  try {
-    return await withMongo(mongoUri, async (db) => {
-      const collection = db.collection('gallery');
-      const doc = await collection.findOne(
-        {
-          $or: [
-            { 'telegram.file_id': fileId },
-            { 'telegram.file_id_lossy': fileId },
-          ],
-        },
-        {
-          projection: {
-            _id: 1,
-            'telegram.bot_token': 1,
-            'telegram.file_id': 1,
-            'telegram.file_id_lossy': 1,
-            'telegram.file_id_format': 1,
-            'telegram.file_id_lossy_format': 1,
-          },
-        }
-      );
-      if (!doc) return null;
-
-      let dbFormat = null;
-      if (doc.telegram) {
-        if (fileId === doc.telegram.file_id && doc.telegram.file_id_format) {
-          dbFormat = doc.telegram.file_id_format;
-        } else if (fileId === doc.telegram.file_id_lossy && doc.telegram.file_id_lossy_format) {
-          dbFormat = doc.telegram.file_id_lossy_format;
-        }
-      }
-
-      return {
-        botToken: doc.telegram?.bot_token || null,
-        docId: doc._id?.toString() || null,
-        dbFormat: normalizeExt(dbFormat),
-      };
-    });
-  } catch (e) {
-    return null;
-  }
-}
-
 // ========== MongoDB helper ==========
 
-let _cachedClient = null;
-let _cachedClientUri = null;
+const MONGO_CONNECT_TIMEOUT_MS = 5000;
+const MONGO_SOCKET_TIMEOUT_MS = 10000;
+const MONGO_SERVER_SELECTION_TIMEOUT_MS = 5000;
 
-const MONGO_MAX_RETRIES = 2;
-
-async function ensureMongoClient(mongoUri) {
-  if (_cachedClient && _cachedClientUri === mongoUri) {
-    try {
-      await _cachedClient.connect(); // no-op if already connected
-      return;
-    } catch (e) {
-      _cachedClient = null;
-      _cachedClientUri = null;
-    }
-  }
-
-  if (!_cachedClient) {
-    const client = new MongoClient(mongoUri);
+/**
+ * Stateless MongoDB helper — creates a fresh client per request and closes it
+ * when done. Cloudflare Workers are stateless; global client caching leads to
+ * stale/dead sockets that hang the entire Worker.
+ */
+async function withMongo(mongoUri, fn) {
+  const client = new MongoClient(mongoUri, {
+    connectTimeoutMS: MONGO_CONNECT_TIMEOUT_MS,
+    socketTimeoutMS: MONGO_SOCKET_TIMEOUT_MS,
+    serverSelectionTimeoutMS: MONGO_SERVER_SELECTION_TIMEOUT_MS,
+  });
+  try {
     await client.connect();
-    _cachedClient = client;
-    _cachedClientUri = mongoUri;
+    const db = client.db('magic_plugin_db');
+    return await fn(db);
+  } finally {
+    // Always close — don't let sockets linger across isolate reuses.
+    try { await client.close(); } catch (_) { /* ignore */ }
   }
 }
 
-async function withMongo(mongoUri, fn) {
-  let lastError;
-  for (let attempt = 0; attempt <= MONGO_MAX_RETRIES; attempt++) {
-    try {
-      await ensureMongoClient(mongoUri);
-      const db = _cachedClient.db('magic_plugin_db');
-      return await fn(db);
-    } catch (e) {
-      lastError = e;
-      // Discard the client so the next attempt creates a fresh connection.
-      _cachedClient = null;
-      _cachedClientUri = null;
-      if (attempt < MONGO_MAX_RETRIES) {
-        // Brief pause before retry (50ms, then 150ms).
-        await new Promise((r) => setTimeout(r, 50 * (attempt + 1)));
-      }
-    }
-  }
-  throw lastError;
+// Race any promise against a timeout — prevents Worker hangs.
+function withTimeout(promise, ms, label = 'Operation') {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) =>
+      setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms)
+    ),
+  ]);
 }
 
 // ========== CORS headers ==========
@@ -594,33 +536,11 @@ async function handleFileUrl(request, env, ctx) {
     if (cachedResponse) return cachedResponse;
   }
 
-  // --- Resolve metadata ---
+  // --- Resolve metadata (NO MongoDB — purely from env + URL hints) ---
   const filenameHint = url.searchParams.get('filename_hint') || '';
   const hintedExt = extFromFilenameHint(filenameHint);
-  const MONGO_URI = env.MONGO_URI;
-  const cachedMeta = getCachedValue(fileMetaCache, file_id);
-  let botToken = cachedMeta?.botToken || env.BOT_TOKEN || null;
-  let docId = cachedMeta?.docId || null;
-  let dbFormat = normalizeExt(cachedMeta?.dbFormat) || hintedExt;
-
-  // Load DB meta if needed (for bot token or format info)
-  let dbMeta = null;
-  if (!botToken || !docId) {
-    const inMemory = getCachedValue(fileMetaCache, file_id);
-    if (inMemory) {
-      dbMeta = inMemory;
-    } else {
-      dbMeta = await lookupFileMetaFromDb(MONGO_URI, file_id);
-      if (dbMeta) {
-        setCachedValue(fileMetaCache, file_id, dbMeta, FILE_META_CACHE_TTL_MS, FILE_META_CACHE_MAX_ITEMS);
-      }
-    }
-    if (dbMeta) {
-      botToken = botToken || dbMeta.botToken;
-      docId = docId || dbMeta.docId;
-      dbFormat = dbFormat || normalizeExt(dbMeta.dbFormat);
-    }
-  }
+  const botToken = env.BOT_TOKEN || null;
+  const dbFormat = hintedExt;
 
   if (!botToken) {
     return jsonResponse({ error: 'No bot token available' }, 500);
@@ -632,7 +552,7 @@ async function handleFileUrl(request, env, ctx) {
     const pathExt = normalizeExt(filePath && filePath.includes('.') ? filePath.split('.').pop() : null);
     const ctExt = extFromContentType(contentType);
     const ext = normalizeExt(dbFormat) || hintedExt || (ctExt !== 'bin' ? ctExt : (pathExt || hintedExt || 'bin'));
-    const filenameBase = docId || file_id.slice(0, 16);
+    const filenameBase = file_id.slice(0, 16);
     const filename = `${filenameBase}.${ext}`;
     return new Response(imageResp.body, {
       status: 200,
@@ -656,29 +576,24 @@ async function handleFileUrl(request, env, ctx) {
     return buildImageResponse(imageResp, filePath);
   }
 
-  // --- Collect unique tokens to try ---
-  const tokens = [...new Set([botToken, dbMeta?.botToken].filter(Boolean))];
+  // --- Try official & proxy in parallel (single token, no MongoDB lookup) ---
+  const [officialResult, proxyResult] = await Promise.allSettled([
+    tryFetch(botToken, false),
+    tryFetch(botToken, true),
+  ]);
 
-  // --- Try each token: official & proxy in parallel, tokens sequentially ---
-  for (const token of tokens) {
-    const [officialResult, proxyResult] = await Promise.allSettled([
-      tryFetch(token, false),
-      tryFetch(token, true),
-    ]);
-
-    const response = officialResult.value || proxyResult.value;
-    if (response) {
-      // Write to edge cache in background
-      if (edgeCache && edgeCacheKey) {
-        try {
-          const putPromise = edgeCache.put(edgeCacheKey, response.clone());
-          if (ctx && typeof ctx.waitUntil === 'function') {
-            ctx.waitUntil(putPromise);
-          }
-        } catch (e) { /* ignore */ }
-      }
-      return response;
+  const response = officialResult.value || proxyResult.value;
+  if (response) {
+    // Write to edge cache in background
+    if (edgeCache && edgeCacheKey) {
+      try {
+        const putPromise = edgeCache.put(edgeCacheKey, response.clone());
+        if (ctx && typeof ctx.waitUntil === 'function') {
+          ctx.waitUntil(putPromise);
+        }
+      } catch (e) { /* ignore */ }
     }
+    return response;
   }
 
   return jsonResponse({ error: 'Failed to retrieve file URL' }, 502);
@@ -856,19 +771,19 @@ export default {
 
     // API routing
     if (url.pathname === '/api/login') {
-      return handleLogin(request, env);
+      return withTimeout(handleLogin(request, env), 10000, 'Login');
     }
     if (url.pathname === '/api/gallery') {
-      return handleGallery(request, env);
+      return withTimeout(handleGallery(request, env), 25000, 'Gallery');
     }
     if (url.pathname === '/api/gallery/categories') {
-      return handleCategories(request, env);
+      return withTimeout(handleCategories(request, env), 25000, 'Categories');
     }
     if (url.pathname === '/api/gallery/stats') {
-      return handleStats(request, env);
+      return withTimeout(handleStats(request, env), 25000, 'Stats');
     }
     if (url.pathname === '/api/fileurl') {
-      return handleFileUrl(request, env, ctx);
+      return withTimeout(handleFileUrl(request, env, ctx), 20000, 'FileUrl');
     }
     // /api/file/<file_id>/<filename> — browser-friendly URL with proper filename
     if (url.pathname.startsWith('/api/file/')) {
@@ -881,7 +796,7 @@ export default {
           url.searchParams.set('filename_hint', filenameHint);
         }
         const newReq = new Request(url.toString(), request);
-        return handleFileUrl(newReq, env, ctx);
+        return withTimeout(handleFileUrl(newReq, env, ctx), 20000, 'File');
       }
     }
     if (url.pathname.startsWith('/api/')) {
