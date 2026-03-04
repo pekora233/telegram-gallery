@@ -161,6 +161,15 @@ function extFromFilenameHint(filenameHint) {
   return normalizeExt(filenameHint.slice(idx + 1));
 }
 
+const FETCH_TIMEOUT_MS = 8000;
+
+function fetchWithTimeout(url, opts = {}, timeoutMs = FETCH_TIMEOUT_MS) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  return fetch(url, { ...opts, signal: controller.signal })
+    .finally(() => clearTimeout(timer));
+}
+
 async function resolveTelegramFilePath(botToken, fileId, useProxy = false) {
   if (!botToken || !fileId) return null;
   const cacheKey = `${useProxy ? 'proxy' : 'official'}:${botToken}:${fileId}`;
@@ -168,20 +177,26 @@ async function resolveTelegramFilePath(botToken, fileId, useProxy = false) {
   if (cached) return cached;
 
   const base = useProxy ? TELEGRAM_PROXY : TELEGRAM_OFFICIAL;
-  const resp = await fetch(`${base}/bot${botToken}/getFile?file_id=${encodeURIComponent(fileId)}`);
-  if (!resp.ok) return null;
-  const data = await resp.json().catch(() => null);
-  const filePath = data?.result?.file_path || null;
-  if (!filePath) return null;
+  const url = `${base}/bot${botToken}/getFile?file_id=${encodeURIComponent(fileId)}`;
 
-  setCachedValue(
-    telegramPathCache,
-    cacheKey,
-    filePath,
-    FILE_PATH_CACHE_TTL_MS,
-    FILE_PATH_CACHE_MAX_ITEMS
-  );
-  return filePath;
+  try {
+    const resp = await fetchWithTimeout(url);
+    if (!resp.ok) return null;
+    const data = await resp.json().catch(() => null);
+    const filePath = data?.result?.file_path || null;
+    if (!filePath) return null;
+
+    setCachedValue(
+      telegramPathCache,
+      cacheKey,
+      filePath,
+      FILE_PATH_CACHE_TTL_MS,
+      FILE_PATH_CACHE_MAX_ITEMS
+    );
+    return filePath;
+  } catch (e) {
+    return null;
+  }
 }
 
 async function lookupFileMetaFromDb(mongoUri, fileId) {
@@ -234,13 +249,14 @@ async function lookupFileMetaFromDb(mongoUri, fileId) {
 let _cachedClient = null;
 let _cachedClientUri = null;
 
-async function withMongo(mongoUri, fn) {
-  // Reuse cached client when possible; fall back to a fresh client on failure.
+const MONGO_MAX_RETRIES = 2;
+
+async function ensureMongoClient(mongoUri) {
   if (_cachedClient && _cachedClientUri === mongoUri) {
     try {
       await _cachedClient.connect(); // no-op if already connected
+      return;
     } catch (e) {
-      // Stale connection — discard and create a fresh client below.
       _cachedClient = null;
       _cachedClientUri = null;
     }
@@ -248,19 +264,31 @@ async function withMongo(mongoUri, fn) {
 
   if (!_cachedClient) {
     const client = new MongoClient(mongoUri);
-    try {
-      await client.connect();
-    } catch (e) {
-      _cachedClient = null;
-      _cachedClientUri = null;
-      throw e;
-    }
+    await client.connect();
     _cachedClient = client;
     _cachedClientUri = mongoUri;
   }
+}
 
-  const db = _cachedClient.db('magic_plugin_db');
-  return await fn(db);
+async function withMongo(mongoUri, fn) {
+  let lastError;
+  for (let attempt = 0; attempt <= MONGO_MAX_RETRIES; attempt++) {
+    try {
+      await ensureMongoClient(mongoUri);
+      const db = _cachedClient.db('magic_plugin_db');
+      return await fn(db);
+    } catch (e) {
+      lastError = e;
+      // Discard the client so the next attempt creates a fresh connection.
+      _cachedClient = null;
+      _cachedClientUri = null;
+      if (attempt < MONGO_MAX_RETRIES) {
+        // Brief pause before retry (50ms, then 150ms).
+        await new Promise((r) => setTimeout(r, 50 * (attempt + 1)));
+      }
+    }
+  }
+  throw lastError;
 }
 
 // ========== CORS headers ==========
@@ -553,6 +581,7 @@ async function handleFileUrl(request, env, ctx) {
     return jsonResponse({ error: 'file_id required' }, 400);
   }
 
+  // --- Edge cache check ---
   const edgeCache = (request.method === 'GET' && typeof caches !== 'undefined' && caches.default)
     ? caches.default
     : null;
@@ -562,11 +591,10 @@ async function handleFileUrl(request, env, ctx) {
 
   if (edgeCache && edgeCacheKey) {
     const cachedResponse = await edgeCache.match(edgeCacheKey);
-    if (cachedResponse) {
-      return cachedResponse;
-    }
+    if (cachedResponse) return cachedResponse;
   }
 
+  // --- Resolve metadata ---
   const filenameHint = url.searchParams.get('filename_hint') || '';
   const hintedExt = extFromFilenameHint(filenameHint);
   const MONGO_URI = env.MONGO_URI;
@@ -575,28 +603,32 @@ async function handleFileUrl(request, env, ctx) {
   let docId = cachedMeta?.docId || null;
   let dbFormat = normalizeExt(cachedMeta?.dbFormat) || hintedExt;
 
-  async function loadDbMeta() {
+  // Load DB meta if needed (for bot token or format info)
+  let dbMeta = null;
+  if (!botToken || !docId) {
     const inMemory = getCachedValue(fileMetaCache, file_id);
-    if (inMemory) return inMemory;
-    const fromDb = await lookupFileMetaFromDb(MONGO_URI, file_id);
-    if (!fromDb) return null;
-    setCachedValue(fileMetaCache, file_id, fromDb, FILE_META_CACHE_TTL_MS, FILE_META_CACHE_MAX_ITEMS);
-    return fromDb;
-  }
-
-  if (!botToken) {
-    const dbMeta = await loadDbMeta();
-    botToken = dbMeta?.botToken || null;
-    docId = dbMeta?.docId || null;
-    dbFormat = normalizeExt(dbMeta?.dbFormat) || dbFormat;
-    if (!botToken) {
-      return jsonResponse({ error: 'No bot token available' }, 500);
+    if (inMemory) {
+      dbMeta = inMemory;
+    } else {
+      dbMeta = await lookupFileMetaFromDb(MONGO_URI, file_id);
+      if (dbMeta) {
+        setCachedValue(fileMetaCache, file_id, dbMeta, FILE_META_CACHE_TTL_MS, FILE_META_CACHE_MAX_ITEMS);
+      }
+    }
+    if (dbMeta) {
+      botToken = botToken || dbMeta.botToken;
+      docId = docId || dbMeta.docId;
+      dbFormat = dbFormat || normalizeExt(dbMeta.dbFormat);
     }
   }
 
+  if (!botToken) {
+    return jsonResponse({ error: 'No bot token available' }, 500);
+  }
+
+  // --- Helper: build the final image response ---
   function buildImageResponse(imageResp, filePath) {
     const contentType = imageResp.headers.get('content-type') || 'application/octet-stream';
-    // Prefer format from DB, then Content-Type, then file_path extension
     const pathExt = normalizeExt(filePath && filePath.includes('.') ? filePath.split('.').pop() : null);
     const ctExt = extFromContentType(contentType);
     const ext = normalizeExt(dbFormat) || hintedExt || (ctExt !== 'bin' ? ctExt : (pathExt || hintedExt || 'bin'));
@@ -614,55 +646,39 @@ async function handleFileUrl(request, env, ctx) {
     });
   }
 
-  async function cacheAndReturn(response) {
-    if (!response || response.status !== 200 || !edgeCache || !edgeCacheKey) {
-      return response;
-    }
-
-    try {
-      const putPromise = edgeCache.put(edgeCacheKey, response.clone());
-      if (ctx && typeof ctx.waitUntil === 'function') {
-        ctx.waitUntil(putPromise);
-      } else {
-        await putPromise;
-      }
-    } catch (e) {
-      // ignore edge cache write failures and still serve origin response
-    }
-    return response;
-  }
-
-  async function fetchWithToken(token, useProxy = false) {
+  // --- Helper: try to resolve file path and fetch image ---
+  async function tryFetch(token, useProxy) {
     const filePath = await resolveTelegramFilePath(token, file_id, useProxy);
     if (!filePath) return null;
-
-    const urlDirect = buildUrlFromFilePath(token, filePath, useProxy);
-    const imageResp = await fetch(urlDirect).catch(() => null);
+    const imageUrl = buildUrlFromFilePath(token, filePath, useProxy);
+    const imageResp = await fetchWithTimeout(imageUrl).catch(() => null);
     if (!imageResp || !imageResp.ok) return null;
     return buildImageResponse(imageResp, filePath);
   }
 
-  const triedTokens = new Set();
-  async function tryFetchWithToken(token) {
-    if (!token || triedTokens.has(token)) return null;
-    triedTokens.add(token);
+  // --- Collect unique tokens to try ---
+  const tokens = [...new Set([botToken, dbMeta?.botToken].filter(Boolean))];
 
-    let response = await fetchWithToken(token, false);
-    if (response) return response;
-    response = await fetchWithToken(token, true);
-    return response;
-  }
+  // --- Try each token: official & proxy in parallel, tokens sequentially ---
+  for (const token of tokens) {
+    const [officialResult, proxyResult] = await Promise.allSettled([
+      tryFetch(token, false),
+      tryFetch(token, true),
+    ]);
 
-  let imageResponse = await tryFetchWithToken(botToken);
-  if (imageResponse) return cacheAndReturn(imageResponse);
-
-  // env.BOT_TOKEN fails: try DB token as fallback (and cache it).
-  const dbMeta = await loadDbMeta();
-  if (dbMeta) {
-    docId = dbMeta.docId || docId;
-    dbFormat = normalizeExt(dbMeta.dbFormat) || dbFormat;
-    imageResponse = await tryFetchWithToken(dbMeta.botToken || botToken);
-    if (imageResponse) return cacheAndReturn(imageResponse);
+    const response = officialResult.value || proxyResult.value;
+    if (response) {
+      // Write to edge cache in background
+      if (edgeCache && edgeCacheKey) {
+        try {
+          const putPromise = edgeCache.put(edgeCacheKey, response.clone());
+          if (ctx && typeof ctx.waitUntil === 'function') {
+            ctx.waitUntil(putPromise);
+          }
+        } catch (e) { /* ignore */ }
+      }
+      return response;
+    }
   }
 
   return jsonResponse({ error: 'Failed to retrieve file URL' }, 502);

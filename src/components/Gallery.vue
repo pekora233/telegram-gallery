@@ -38,6 +38,28 @@ let lastRootBackAt = 0;
 let hasDetailHistoryState = false;
 let suppressNextPopstate = false;
 
+// Retry wrapper for fetch — retries on network errors and 5xx responses
+async function fetchWithRetry(input, init, { retries = 2, delay = 300 } = {}) {
+  let lastError;
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      const resp = await fetch(input, init);
+      // Retry on 5xx server errors (likely transient Worker/DB issues)
+      if (resp.status >= 500 && attempt < retries) {
+        await new Promise((r) => setTimeout(r, delay * (attempt + 1)));
+        continue;
+      }
+      return resp;
+    } catch (e) {
+      lastError = e;
+      if (attempt < retries) {
+        await new Promise((r) => setTimeout(r, delay * (attempt + 1)));
+      }
+    }
+  }
+  throw lastError;
+}
+
 // 显示模式：desc（倒序/默认）、asc（正序）、pagination（分页）、categories（分类）
 const DISPLAY_MODES = new Set(['desc', 'asc', 'pagination', 'categories']);
 const savedDisplayMode = localStorage.getItem('gallery_display_mode');
@@ -414,7 +436,7 @@ function finalizeDeleteSuccess(entry) {
 }
 
 async function requestDeleteById(entryId) {
-  const resp = await fetch('/api/gallery', {
+  const resp = await fetchWithRetry('/api/gallery', {
     method: 'DELETE',
     headers: {
       'Content-Type': 'application/json',
@@ -471,7 +493,7 @@ async function fetchGalleryPage(cursor = null, limit = PAGE_SIZE, sort = 'desc')
   if (cursor) params.set('cursor', cursor);
   if (sort === 'asc') params.set('sort', 'asc');
 
-  const resp = await fetch(`/api/gallery?${params.toString()}`, {
+  const resp = await fetchWithRetry(`/api/gallery?${params.toString()}`, {
     headers: { Authorization: `Bearer ${token}` }
   });
 
@@ -555,7 +577,7 @@ async function fetchGalleryNumberedPage(page = 1, pageSize = PAGINATION_VIEW_SIZ
   if (sort === 'asc') params.set('sort', 'asc');
   if (batchCursor) params.set('batchCursor', batchCursor);
 
-  const resp = await fetch(`/api/gallery?${params.toString()}`, {
+  const resp = await fetchWithRetry(`/api/gallery?${params.toString()}`, {
     headers: { Authorization: `Bearer ${token}` }
   });
 
@@ -703,7 +725,7 @@ async function loadEntryImageNow(entry, fileId) {
     // 从服务器获取图片并缓存 blob
     const fmt = getDisplayFormat(entry);
     const imageUrl = buildFileUrl(fileId, fmt, false);
-    const resp = await fetch(imageUrl);
+    const resp = await fetchWithRetry(imageUrl, undefined, { retries: 1 });
     if (!resp.ok) throw new Error('Failed to fetch image');
     const blob = await resp.blob();
 
@@ -1114,7 +1136,7 @@ async function loadCategories() {
   if (categoriesData.value.length > 0) return; // 已加载过
   categoriesLoading.value = true;
   try {
-    const resp = await fetch("/api/gallery/categories", {
+    const resp = await fetchWithRetry("/api/gallery/categories", {
       headers: { Authorization: `Bearer ${token}` },
     });
     if (!resp.ok) throw new Error("Failed to load categories");
@@ -1233,7 +1255,7 @@ async function refreshSingleImage(entry) {
   entry.loading = true;
   try {
     const imageUrl = buildFileUrl(displayFileId, getDisplayFormat(entry), true);
-    const resp = await fetch(imageUrl);
+    const resp = await fetchWithRetry(imageUrl, undefined, { retries: 1 });
     if (!resp.ok) throw new Error('Failed to fetch image');
     const blob = await resp.blob();
 
