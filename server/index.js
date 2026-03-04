@@ -234,19 +234,32 @@ async function lookupFileMetaFromDb(mongoUri, fileId) {
 let _cachedClient = null;
 let _cachedClientUri = null;
 
-function getMongoClient(mongoUri) {
-  if (_cachedClient && _cachedClientUri === mongoUri) {
-    return _cachedClient;
-  }
-  _cachedClient = new MongoClient(mongoUri);
-  _cachedClientUri = mongoUri;
-  return _cachedClient;
-}
-
 async function withMongo(mongoUri, fn) {
-  const client = getMongoClient(mongoUri);
-  await client.connect(); // no-op if already connected
-  const db = client.db('magic_plugin_db');
+  // Reuse cached client when possible; fall back to a fresh client on failure.
+  if (_cachedClient && _cachedClientUri === mongoUri) {
+    try {
+      await _cachedClient.connect(); // no-op if already connected
+    } catch (e) {
+      // Stale connection — discard and create a fresh client below.
+      _cachedClient = null;
+      _cachedClientUri = null;
+    }
+  }
+
+  if (!_cachedClient) {
+    const client = new MongoClient(mongoUri);
+    try {
+      await client.connect();
+    } catch (e) {
+      _cachedClient = null;
+      _cachedClientUri = null;
+      throw e;
+    }
+    _cachedClient = client;
+    _cachedClientUri = mongoUri;
+  }
+
+  const db = _cachedClient.db('magic_plugin_db');
   return await fn(db);
 }
 
