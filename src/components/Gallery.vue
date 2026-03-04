@@ -702,8 +702,15 @@ async function prefetchPaginationAhead(currentPage = paginationPage.value) {
   }
 }
 
-async function loadEntryImageNow(entry, fileId) {
-  if (!entry || !fileId) return;
+// Resolve the live reactive entry from entries.value by ID.
+// The queued reference may be stale if entries.value was reassigned
+// (e.g. by polling or page switch) while the fetch was in-flight.
+function resolveLiveEntry(staleEntry) {
+  return entries.value.find((e) => e.id === staleEntry.id) || staleEntry;
+}
+
+async function loadEntryImageNow(queuedEntry, fileId) {
+  if (!queuedEntry || !fileId) return;
   if (pendingImageLoads.has(fileId)) return;
   pendingImageLoads.add(fileId);
   try {
@@ -712,6 +719,7 @@ async function loadEntryImageNow(entry, fileId) {
       try {
         const cachedBlob = await getImageBlob(fileId);
         if (cachedBlob) {
+          const entry = resolveLiveEntry(queuedEntry);
           entry.displayFileId = fileId;
           entry.src = URL.createObjectURL(cachedBlob);
           entry.loading = false;
@@ -723,12 +731,13 @@ async function loadEntryImageNow(entry, fileId) {
     }
 
     // 从服务器获取图片并缓存 blob
-    const fmt = getDisplayFormat(entry);
+    const fmt = getDisplayFormat(queuedEntry);
     const imageUrl = buildFileUrl(fileId, fmt, false);
     const resp = await fetchWithRetry(imageUrl, undefined, { retries: 1 });
     if (!resp.ok) throw new Error('Failed to fetch image');
     const blob = await resp.blob();
 
+    const entry = resolveLiveEntry(queuedEntry);
     entry.displayFileId = fileId;
     entry.src = URL.createObjectURL(blob);
     entry.loading = false;
@@ -744,6 +753,7 @@ async function loadEntryImageNow(entry, fileId) {
   } catch (err) {
     console.error('Failed to load image:', err);
     // 回退到直接 URL
+    const entry = resolveLiveEntry(queuedEntry);
     const imageUrl = buildFileUrl(fileId, getDisplayFormat(entry), false);
     entry.displayFileId = fileId;
     entry.src = imageUrl;
