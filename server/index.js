@@ -257,6 +257,10 @@ async function lookupFileMetaFromDb(mongoUri, fileId) {
 const MONGO_CONNECT_TIMEOUT_MS = 5000;
 const MONGO_SOCKET_TIMEOUT_MS = 10000;
 const MONGO_SERVER_SELECTION_TIMEOUT_MS = 5000;
+const GALLERY_MAX_PAGE_SPAN = 6;
+const GALLERY_COUNT_CACHE_TTL_MS = 30 * 1000;
+let galleryCountCacheValue = null;
+let galleryCountCacheExpiresAt = 0;
 
 /**
  * Stateless MongoDB helper — creates a fresh client per request and closes it
@@ -280,6 +284,21 @@ async function withMongo(mongoUri, fn) {
     // Always close — don't let sockets linger across isolate reuses.
     try { await client.close(); } catch (_) { /* ignore */ }
   }
+}
+
+async function getCachedEstimatedGalleryCount(collection) {
+  if (galleryCountCacheValue !== null && galleryCountCacheExpiresAt > Date.now()) {
+    return galleryCountCacheValue;
+  }
+  const total = await collection.estimatedDocumentCount();
+  galleryCountCacheValue = total;
+  galleryCountCacheExpiresAt = Date.now() + GALLERY_COUNT_CACHE_TTL_MS;
+  return total;
+}
+
+function invalidateCachedGalleryCount() {
+  galleryCountCacheValue = null;
+  galleryCountCacheExpiresAt = 0;
 }
 
 // Race any promise against a timeout — prevents Worker hangs.
@@ -380,6 +399,7 @@ async function handleGallery(request, env) {
       try {
         const result = await collection.deleteOne({ _id: new ObjectId(id) });
         if (result.deletedCount === 1) {
+          invalidateCachedGalleryCount();
           return jsonResponse({ ok: true, deletedId: id });
         } else {
           return jsonResponse({ error: 'Not found' }, 404);
@@ -456,13 +476,13 @@ async function handleGallery(request, env) {
         ? Math.max(1, Math.min(parsedPageSize, 200))
         : 60;
       const pageSpan = Number.isFinite(parsedPageSpan)
-        ? Math.max(1, Math.min(parsedPageSpan, 20))
+        ? Math.max(1, Math.min(parsedPageSpan, GALLERY_MAX_PAGE_SPAN))
         : 1;
       const requestedPage = Number.isFinite(parsedPage)
         ? Math.max(1, parsedPage)
         : 1;
 
-      const totalCount = await collection.estimatedDocumentCount();
+      const totalCount = await getCachedEstimatedGalleryCount(collection);
       const totalPages = Math.max(1, Math.ceil(totalCount / pageSize));
       const page = Math.min(requestedPage, totalPages);
       const batchStartPage = Math.floor((page - 1) / pageSpan) * pageSpan + 1;

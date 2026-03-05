@@ -65,7 +65,9 @@ const DISPLAY_MODES = new Set(['desc', 'asc', 'pagination', 'categories']);
 const savedDisplayMode = localStorage.getItem('gallery_display_mode');
 const displayMode = ref(DISPLAY_MODES.has(savedDisplayMode) ? savedDisplayMode : 'desc');
 const PAGINATION_VIEW_SIZE = 60;
-const PAGINATION_PREFETCH_PAGES = 10;
+const PAGINATION_PREFETCH_PAGES = 5;
+const POLL_INTERVAL_MS = 3 * 60 * 1000;
+const POLL_LATEST_LIMIT = 30;
 const PAGINATION_PAGE_KEY = 'gallery_pagination_page';
 function readSavedPaginationPage() {
   try {
@@ -82,6 +84,7 @@ const PAGINATION_CACHE_MAX_PAGES = 30;
 const paginationBatchRequests = new Map();
 let paginationBatchEndCursor = null;
 let paginationLastBatchEndPage = 0;
+let pollInFlight = false;
 
 // 分类数据
 const categoriesData = ref([]);
@@ -854,11 +857,17 @@ async function loadPaginationPage(targetPage = 1, options = {}) {
   error.value = "";
   const resolvedPage = Math.max(1, Math.trunc(Number(targetPage) || 1));
   const forceRefresh = Boolean(options?.forceRefresh);
+  const bypassCache = forceRefresh || Boolean(options?.bypassCache);
+  const skipPrefetch = Boolean(options?.skipPrefetch);
+  const optionPageSpan = Number(options?.pageSpan);
+  const pageSpanForFetch = Number.isFinite(optionPageSpan)
+    ? Math.max(1, Math.min(Math.trunc(optionPageSpan), PAGINATION_PREFETCH_PAGES))
+    : PAGINATION_PREFETCH_PAGES;
   if (forceRefresh) {
     clearPaginationPageCache();
   }
 
-  if (!forceRefresh) {
+  if (!bypassCache) {
     const cachedItems = paginationPageCache.get(resolvedPage);
     if (Array.isArray(cachedItems)) {
       // LRU: move accessed page to the end
@@ -876,7 +885,9 @@ async function loadPaginationPage(targetPage = 1, options = {}) {
       renderCount.value = entries.value.length;
       queueImageLoads(getVisibleEntriesForCurrentMode());
       syncSelectionWithEntries();
-      void prefetchPaginationAhead(resolvedPage);
+      if (!skipPrefetch) {
+        void prefetchPaginationAhead(resolvedPage);
+      }
       return;
     }
   }
@@ -894,7 +905,7 @@ async function loadPaginationPage(targetPage = 1, options = {}) {
       resolvedPage,
       PAGINATION_VIEW_SIZE,
       'desc',
-      PAGINATION_PREFETCH_PAGES
+      pageSpanForFetch
     );
     cachePaginationPages(pageData.pages);
     cachePaginationPages({ [pageData.page]: pageData.items });
@@ -926,7 +937,9 @@ async function loadPaginationPage(targetPage = 1, options = {}) {
 
     queueImageLoads(getVisibleEntriesForCurrentMode());
     syncSelectionWithEntries();
-    void prefetchPaginationAhead(pageData.page);
+    if (!skipPrefetch) {
+      void prefetchPaginationAhead(pageData.page);
+    }
   } catch (e) {
     error.value = String(e);
   } finally {
@@ -1010,6 +1023,39 @@ async function load(forceImageRefresh = false, forceListRefresh = false) {
         setupLoadMoreObserver();
       });
     }
+  }
+}
+
+async function refreshOnPoll() {
+  if (pollInFlight) return;
+  if (document.visibilityState !== 'visible') return;
+  if (loading.value || loadingMore.value) return;
+  if (displayMode.value === 'categories') return;
+
+  pollInFlight = true;
+  try {
+    if (displayMode.value === 'pagination') {
+      if (paginationPage.value !== 1) return;
+      await loadPaginationPage(1, {
+        bypassCache: true,
+        pageSpan: 1,
+        skipPrefetch: true,
+      });
+      return;
+    }
+    if (displayMode.value === 'desc') {
+      const page = await fetchGalleryPage(null, POLL_LATEST_LIMIT, 'desc');
+      const hadEntries = entries.value.length > 0;
+      mergeTopPage(page.items, false, hadEntries);
+      paginationCursor.value = page.nextCursor;
+      hasMore.value = page.hasMore;
+      return;
+    }
+    await load(false, true);
+  } catch (e) {
+    console.warn('Polling refresh failed:', e);
+  } finally {
+    pollInFlight = false;
   }
 }
 
@@ -1680,8 +1726,8 @@ onMounted(() => {
   });
 
   pollTimer = setInterval(() => {
-    void load(false, true);
-  }, 60000);
+    void refreshOnPoll();
+  }, POLL_INTERVAL_MS);
 });
 
 onUnmounted(() => {
@@ -1692,6 +1738,7 @@ onUnmounted(() => {
     clearInterval(pollTimer);
     pollTimer = null;
   }
+  pollInFlight = false;
   if (loadMoreObserver) {
     loadMoreObserver.disconnect();
     loadMoreObserver = null;
