@@ -383,7 +383,7 @@ async function handleLogin(request, env) {
   // Verify Turnstile
   if (turnstileToken) {
     const clientIp = request.headers.get('cf-connecting-ip') ||
-                     request.headers.get('x-forwarded-for')?.split(',')[0] || '';
+      request.headers.get('x-forwarded-for')?.split(',')[0] || '';
     const isValid = await verifyTurnstileToken(turnstileToken, clientIp, env.TURNSTILE_SECRET_KEY);
     if (!isValid) {
       return jsonResponse({ error: '人机验证失败，请重试' }, 403);
@@ -911,52 +911,52 @@ async function handleStats(request, env) {
 export default {
   async fetch(request, env, ctx) {
     try {
-    const url = new URL(request.url);
+      const url = new URL(request.url);
 
-    // CORS preflight
-    if (request.method === 'OPTIONS') {
-      return new Response(null, {
-        status: 200,
-        headers: corsHeaders(),
-      });
-    }
-
-    // API routing
-    if (url.pathname === '/api/login') {
-      return withTimeout(handleLogin(request, env), 10000, 'Login');
-    }
-    if (url.pathname === '/api/gallery') {
-      return withTimeout(handleGallery(request, env), 25000, 'Gallery');
-    }
-    if (url.pathname === '/api/gallery/categories') {
-      return withTimeout(handleCategories(request, env), 25000, 'Categories');
-    }
-    if (url.pathname === '/api/gallery/stats') {
-      return withTimeout(handleStats(request, env), 25000, 'Stats');
-    }
-    if (url.pathname === '/api/fileurl') {
-      return withTimeout(handleFileUrl(request, env, ctx), 20000, 'FileUrl');
-    }
-    // /api/file/<file_id>/<filename> — browser-friendly URL with proper filename
-    if (url.pathname.startsWith('/api/file/')) {
-      const segments = url.pathname.slice('/api/file/'.length).split('/');
-      const fileId = decodeURIComponent(segments[0] || '');
-      const filenameHint = decodeURIComponent(segments[1] || '');
-      if (fileId) {
-        url.searchParams.set('file_id', fileId);
-        if (filenameHint) {
-          url.searchParams.set('filename_hint', filenameHint);
-        }
-        const newReq = new Request(url.toString(), request);
-        return withTimeout(handleFileUrl(newReq, env, ctx), 20000, 'File');
+      // CORS preflight
+      if (request.method === 'OPTIONS') {
+        return new Response(null, {
+          status: 200,
+          headers: corsHeaders(),
+        });
       }
-    }
-    if (url.pathname.startsWith('/api/')) {
-      return jsonResponse({ error: 'Not Found' }, 404);
-    }
 
-    // Non-API routes are handled by the assets (SPA)
-    return new Response(null, { status: 404 });
+      // API routing
+      if (url.pathname === '/api/login') {
+        return withTimeout(handleLogin(request, env), 10000, 'Login');
+      }
+      if (url.pathname === '/api/gallery') {
+        return withTimeout(handleGallery(request, env), 25000, 'Gallery');
+      }
+      if (url.pathname === '/api/gallery/categories') {
+        return withTimeout(handleCategories(request, env), 25000, 'Categories');
+      }
+      if (url.pathname === '/api/gallery/stats') {
+        return withTimeout(handleStats(request, env), 25000, 'Stats');
+      }
+      if (url.pathname === '/api/fileurl') {
+        return withTimeout(handleFileUrl(request, env, ctx), 20000, 'FileUrl');
+      }
+      // /api/file/<file_id>/<filename> — browser-friendly URL with proper filename
+      if (url.pathname.startsWith('/api/file/')) {
+        const segments = url.pathname.slice('/api/file/'.length).split('/');
+        const fileId = decodeURIComponent(segments[0] || '');
+        const filenameHint = decodeURIComponent(segments[1] || '');
+        if (fileId) {
+          url.searchParams.set('file_id', fileId);
+          if (filenameHint) {
+            url.searchParams.set('filename_hint', filenameHint);
+          }
+          const newReq = new Request(url.toString(), request);
+          return withTimeout(handleFileUrl(newReq, env, ctx), 20000, 'File');
+        }
+      }
+      if (url.pathname.startsWith('/api/')) {
+        return jsonResponse({ error: 'Not Found' }, 404);
+      }
+
+      // Non-API routes are handled by the assets (SPA)
+      return new Response(null, { status: 404 });
     } catch (e) {
       console.error('Unhandled worker error:', e);
       return jsonResponse({ error: 'Internal Server Error', message: String(e?.message || e) }, 500);

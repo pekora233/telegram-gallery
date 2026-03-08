@@ -1,7 +1,7 @@
 <script setup>
-import { computed, ref, onMounted, onUnmounted, watch } from 'vue';
-import PhotoSwipeLightbox from 'photoswipe/lightbox';
-import 'photoswipe/style.css';
+import { computed, ref, onMounted, onUnmounted, watch } from "vue";
+import PhotoSwipeLightbox from "photoswipe/lightbox";
+import "photoswipe/style.css";
 
 const props = defineProps({
   entries: Array,
@@ -14,7 +14,7 @@ const props = defineProps({
   onNeedMore: Function
 });
 
-const copySuccess = ref('');
+const copySuccess = ref("");
 let lightbox = null;
 let lightboxDataSource = [];
 const PHOTOSWIPE_AUTO_LOAD_THRESHOLD = 5;
@@ -29,25 +29,28 @@ function getOriginalFormat(entry) {
   return entry?.telegram?.file_id_format || null;
 }
 
-const canDownloadOriginal = computed(() => Boolean(currentEntry.value?.telegram?.file_id));
+const canDownloadOriginal = computed(() =>
+  Boolean(currentEntry.value?.telegram?.file_id)
+);
 
 function getOriginalDownloadUrl() {
   const fileId = currentEntry.value?.telegram?.file_id;
-  if (!fileId) return '';
+  if (!fileId) return "";
   const fmt = getOriginalFormat(currentEntry.value);
-  const filename = fmt ? `image.${fmt}` : 'image';
+  const filename = fmt ? `image.${fmt}` : "image";
   return `/api/file/${encodeURIComponent(fileId)}/${filename}?t=${Date.now()}`;
 }
 
 const metaLines = computed(() => {
   const m = currentEntry.value?.metadata || {};
   const lines = [];
-  if (m.model) lines.push({ label: '模型', value: m.model });
-  if (m.seed) lines.push({ label: '种子', value: m.seed });
-  if (m.steps) lines.push({ label: '步数', value: m.steps });
-  if (m.cfg_scale) lines.push({ label: 'CFG Scale', value: m.cfg_scale });
-  if (m.sampler_name) lines.push({ label: '采样器', value: m.sampler_name });
-  if (m.width && m.height) lines.push({ label: '尺寸', value: `${m.width} × ${m.height}` });
+  if (m.model) lines.push({ label: "模型", value: m.model });
+  if (m.seed) lines.push({ label: "种子", value: m.seed });
+  if (m.steps) lines.push({ label: "步数", value: m.steps });
+  if (m.cfg_scale) lines.push({ label: "CFG Scale", value: m.cfg_scale });
+  if (m.sampler_name) lines.push({ label: "采样器", value: m.sampler_name });
+  if (m.width && m.height)
+    lines.push({ label: "尺寸", value: `${m.width} × ${m.height}` });
   return lines;
 });
 
@@ -58,13 +61,19 @@ const negativePrompt = computed(() => {
 const promptTags = computed(() => {
   const prompt = currentEntry.value?.prompt;
   if (!prompt) return [];
-  return prompt.split(',').map(tag => tag.trim()).filter(tag => tag.length > 0);
+  return prompt
+    .split(",")
+    .map((tag) => tag.trim())
+    .filter((tag) => tag.length > 0);
 });
 
 const negativePromptTags = computed(() => {
   const prompt = currentEntry.value?.metadata?.negative_prompt;
   if (!prompt) return [];
-  return prompt.split(',').map(tag => tag.trim()).filter(tag => tag.length > 0);
+  return prompt
+    .split(",")
+    .map((tag) => tag.trim())
+    .filter((tag) => tag.length > 0);
 });
 
 const isMultiSelectMode = ref(false);
@@ -86,13 +95,13 @@ function handleTagClick(tag) {
       selectedTags.value.push(tag);
     }
   } else {
-    copyToClipboard(tag, '标签');
+    copyToClipboard(tag, "标签");
   }
 }
 
 function copySelected() {
   if (selectedTags.value.length === 0) return;
-  copyToClipboard(selectedTags.value.join(', '), '选中的标签');
+  copyToClipboard(selectedTags.value.join(", "), "选中的标签");
   isMultiSelectMode.value = false;
   selectedTags.value = [];
 }
@@ -110,10 +119,10 @@ async function copyToClipboard(text, label) {
     await navigator.clipboard.writeText(text);
     copySuccess.value = label;
     setTimeout(() => {
-      copySuccess.value = '';
+      copySuccess.value = "";
     }, 2000);
   } catch (err) {
-    console.error('Failed to copy:', err);
+    console.error("Failed to copy:", err);
   }
 }
 
@@ -123,10 +132,10 @@ function copyAllInfo() {
   if (negativePrompt.value) {
     allInfo.push(`负向提示词: ${negativePrompt.value}`);
   }
-  metaLines.value.forEach(item => {
+  metaLines.value.forEach((item) => {
     allInfo.push(`${item.label}: ${item.value}`);
   });
-  copyToClipboard(allInfo.join('\n'), '全部信息');
+  copyToClipboard(allInfo.join("\n"), "全部信息");
 }
 
 const isDownloading = ref(false);
@@ -138,10 +147,10 @@ async function downloadOriginalImage() {
     const url = getOriginalDownloadUrl();
     if (!url) return;
     const resp = await fetch(url);
-    if (!resp.ok) throw new Error('Download failed');
+    if (!resp.ok) throw new Error("Download failed");
 
     // Try to get filename from Content-Disposition header
-    const disposition = resp.headers.get('content-disposition') || '';
+    const disposition = resp.headers.get("content-disposition") || "";
     const filenameMatch = disposition.match(/filename="?([^";\s]+)"?/);
     let filename = filenameMatch ? filenameMatch[1] : null;
 
@@ -151,18 +160,18 @@ async function downloadOriginalImage() {
         const entryId = currentEntry.value?.id || Date.now();
         filename = `image-${entryId}.${fmt}`;
       } else {
-        const contentType = resp.headers.get('content-type') || 'image/png';
+        const contentType = resp.headers.get("content-type") || "image/png";
         const extMap = {
-          'image/png': 'png',
-          'image/jpeg': 'jpg',
-          'image/webp': 'webp',
-          'image/gif': 'gif',
-          'image/avif': 'avif',
-          'image/jxl': 'jxl',
-          'image/bmp': 'bmp',
+          "image/png": "png",
+          "image/jpeg": "jpg",
+          "image/webp": "webp",
+          "image/gif": "gif",
+          "image/avif": "avif",
+          "image/jxl": "jxl",
+          "image/bmp": "bmp"
         };
-        const base = contentType.split(';')[0].trim().toLowerCase();
-        const ext = extMap[base] || 'png';
+        const base = contentType.split(";")[0].trim().toLowerCase();
+        const ext = extMap[base] || "png";
         const entryId = currentEntry.value?.id || Date.now();
         filename = `image-${entryId}.${ext}`;
       }
@@ -170,7 +179,7 @@ async function downloadOriginalImage() {
 
     const blob = await resp.blob();
     const blobUrl = URL.createObjectURL(blob);
-    const link = document.createElement('a');
+    const link = document.createElement("a");
     link.href = blobUrl;
     link.download = filename;
     document.body.appendChild(link);
@@ -178,7 +187,7 @@ async function downloadOriginalImage() {
     document.body.removeChild(link);
     URL.revokeObjectURL(blobUrl);
   } catch (err) {
-    console.error('Download failed:', err);
+    console.error("Download failed:", err);
   } finally {
     isDownloading.value = false;
   }
@@ -186,21 +195,24 @@ async function downloadOriginalImage() {
 
 function toPhotoSwipeItem(entry) {
   const displayFileId = getDisplayFileId(entry);
-  const fmt = entry?.telegram?.file_id_lossy_format || entry?.telegram?.file_id_format || null;
-  const filename = fmt ? `image.${fmt}` : 'image';
+  const fmt =
+    entry?.telegram?.file_id_lossy_format ||
+    entry?.telegram?.file_id_format ||
+    null;
+  const filename = fmt ? `image.${fmt}` : "image";
   const fallbackSrc = displayFileId
     ? `/api/file/${encodeURIComponent(displayFileId)}/${filename}`
-    : '';
+    : "";
   return {
     src: entry?.src || fallbackSrc,
     width: entry?.metadata?.width || 1200,
     height: entry?.metadata?.height || 1600,
-    alt: entry?.prompt || ''
+    alt: entry?.prompt || ""
   };
 }
 
 function maybeRequestMore(currentIndex = props.currentIndex) {
-  if (typeof props.onNeedMore !== 'function') return;
+  if (typeof props.onNeedMore !== "function") return;
   if (!Number.isFinite(currentIndex) || currentIndex < 0) return;
 
   const remaining = props.entries.length - 1 - currentIndex;
@@ -233,17 +245,17 @@ function openPhotoSwipe() {
 
   lightbox = new PhotoSwipeLightbox({
     dataSource: lightboxDataSource,
-    pswpModule: () => import('photoswipe'),
+    pswpModule: () => import("photoswipe"),
     index: props.currentIndex,
     bgOpacity: 0.95,
     spacing: 0.1,
-    showHideAnimationType: 'fade',
+    showHideAnimationType: "fade"
   });
 
-  lightbox.on('change', () => {
+  lightbox.on("change", () => {
     const newIndex = lightbox.pswp.currIndex;
     if (newIndex !== props.currentIndex) {
-      if (typeof props.onSetIndex === 'function') {
+      if (typeof props.onSetIndex === "function") {
         props.onSetIndex(newIndex);
       } else if (newIndex > props.currentIndex) {
         props.onNext();
@@ -254,7 +266,7 @@ function openPhotoSwipe() {
     maybeRequestMore(newIndex);
   });
 
-  lightbox.on('close', () => {
+  lightbox.on("close", () => {
     if (lightbox) {
       lightbox.destroy();
       lightbox = null;
@@ -270,11 +282,11 @@ function openPhotoSwipe() {
 function handleKeydown(e) {
   if (lightbox && lightbox.pswp) return;
 
-  if (e.key === 'ArrowLeft' && props.onPrev) {
+  if (e.key === "ArrowLeft" && props.onPrev) {
     props.onPrev();
-  } else if (e.key === 'ArrowRight' && props.onNext) {
+  } else if (e.key === "ArrowRight" && props.onNext) {
     props.onNext();
-  } else if (e.key === 'Escape' && props.onClose) {
+  } else if (e.key === "Escape" && props.onClose) {
     props.onClose();
   }
 }
@@ -291,8 +303,8 @@ watch(
 );
 
 onMounted(() => {
-  document.body.style.overflow = 'hidden';
-  document.addEventListener('keydown', handleKeydown);
+  document.body.style.overflow = "hidden";
+  document.addEventListener("keydown", handleKeydown);
 });
 
 onUnmounted(() => {
@@ -301,8 +313,8 @@ onUnmounted(() => {
     lightbox = null;
   }
   lightboxDataSource = [];
-  document.body.style.overflow = '';
-  document.removeEventListener('keydown', handleKeydown);
+  document.body.style.overflow = "";
+  document.removeEventListener("keydown", handleKeydown);
 });
 </script>
 
@@ -312,8 +324,15 @@ onUnmounted(() => {
     <div class="top-navbar">
       <div class="navbar-left">
         <button @click="props.onClose" class="nav-icon-btn" title="关闭 (ESC)">
-          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-            <path d="M19 12H5M12 19l-7-7 7-7"/>
+          <svg
+            width="20"
+            height="20"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="2"
+          >
+            <path d="M19 12H5M12 19l-7-7 7-7" />
           </svg>
         </button>
         <div class="navbar-divider"></div>
@@ -323,34 +342,57 @@ onUnmounted(() => {
           <span class="counter-total">{{ props.entries.length }}</span>
         </div>
       </div>
-      
+
       <div class="navbar-center">
-        <button 
+        <button
           v-if="props.onPrev && props.currentIndex > 0"
-          @click="props.onPrev" 
+          @click="props.onPrev"
           class="nav-icon-btn"
           title="上一张 (←)"
         >
-          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-            <polyline points="15 18 9 12 15 6"/>
+          <svg
+            width="20"
+            height="20"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="2"
+          >
+            <polyline points="15 18 9 12 15 6" />
           </svg>
         </button>
-        <button 
+        <button
           v-if="props.onNext && props.currentIndex < props.entries.length - 1"
-          @click="props.onNext" 
+          @click="props.onNext"
           class="nav-icon-btn"
           title="下一张 (→)"
         >
-          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-            <polyline points="9 18 15 12 9 6"/>
+          <svg
+            width="20"
+            height="20"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="2"
+          >
+            <polyline points="9 18 15 12 9 6" />
           </svg>
         </button>
       </div>
 
       <div class="navbar-right">
         <button @click="openPhotoSwipe" class="nav-icon-btn" title="全屏查看">
-          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-            <path d="M8 3H5a2 2 0 00-2 2v3m18 0V5a2 2 0 00-2-2h-3m0 18h3a2 2 0 002-2v-3M3 16v3a2 2 0 002 2h3"/>
+          <svg
+            width="20"
+            height="20"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="2"
+          >
+            <path
+              d="M8 3H5a2 2 0 00-2 2v3m18 0V5a2 2 0 00-2-2h-3m0 18h3a2 2 0 002-2v-3M3 16v3a2 2 0 002 2h3"
+            />
           </svg>
         </button>
       </div>
@@ -359,8 +401,15 @@ onUnmounted(() => {
     <!-- 复制成功提示 -->
     <transition name="slide-fade">
       <div v-if="copySuccess" class="notification-toast">
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
-          <polyline points="20 6 9 17 4 12"/>
+        <svg
+          width="16"
+          height="16"
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          stroke-width="2.5"
+        >
+          <polyline points="20 6 9 17 4 12" />
         </svg>
         <span>已复制{{ copySuccess }}</span>
       </div>
@@ -371,17 +420,24 @@ onUnmounted(() => {
       <!-- 图片展示区 -->
       <div class="image-display">
         <div class="image-container" @click="openPhotoSwipe">
-          <img 
-            :src="currentEntry.src" 
-            :alt="currentEntry.prompt" 
-            class="main-image" 
+          <img
+            :src="currentEntry.src"
+            :alt="currentEntry.prompt"
+            class="main-image"
           />
           <div class="image-overlay">
             <div class="overlay-hint">
-              <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                <circle cx="11" cy="11" r="8"/>
-                <path d="M21 21l-4.35-4.35"/>
-                <path d="M11 8v6M8 11h6"/>
+              <svg
+                width="24"
+                height="24"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="2"
+              >
+                <circle cx="11" cy="11" r="8" />
+                <path d="M21 21l-4.35-4.35" />
+                <path d="M11 8v6M8 11h6" />
               </svg>
               <span>点击放大查看</span>
             </div>
@@ -396,25 +452,68 @@ onUnmounted(() => {
           <div class="panel-toolbar">
             <div class="toolbar-left">
               <div class="toolbar-title">Details</div>
-              <div class="toolbar-subtitle">{{ props.currentIndex + 1 }} of {{ props.entries.length }}</div>
+              <div class="toolbar-subtitle">
+                {{ props.currentIndex + 1 }} of {{ props.entries.length }}
+              </div>
             </div>
             <div class="toolbar-right">
-              <button @click="toggleMultiSelect" :class="['icon-btn', { 'active': isMultiSelectMode }]" title="多选模式">
-                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                  <path d="M9 11l3 3L22 4"/>
-                  <path d="M21 12v7a2 2 0 01-2 2H5a2 2 0 01-2-2V5a2 2 0 012-2h11"/>
+              <button
+                @click="toggleMultiSelect"
+                :class="['icon-btn', { active: isMultiSelectMode }]"
+                title="多选模式"
+              >
+                <svg
+                  width="16"
+                  height="16"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="2"
+                >
+                  <path d="M9 11l3 3L22 4" />
+                  <path
+                    d="M21 12v7a2 2 0 01-2 2H5a2 2 0 01-2-2V5a2 2 0 012-2h11"
+                  />
                 </svg>
               </button>
-              <button v-if="isMultiSelectMode" @click="copySelected" :class="['icon-btn', 'success']" :disabled="selectedTags.length === 0" :title="`复制选中 (${selectedTags.length})`">
-                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                  <rect x="9" y="9" width="13" height="13" rx="2" ry="2"/>
-                  <path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/>
+              <button
+                v-if="isMultiSelectMode"
+                @click="copySelected"
+                :class="['icon-btn', 'success']"
+                :disabled="selectedTags.length === 0"
+                :title="`复制选中 (${selectedTags.length})`"
+              >
+                <svg
+                  width="16"
+                  height="16"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="2"
+                >
+                  <rect x="9" y="9" width="13" height="13" rx="2" ry="2" />
+                  <path
+                    d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"
+                  />
                 </svg>
               </button>
-              <button @click="copyAllInfo" class="icon-btn" title="复制全部信息">
-                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                  <path d="M16 4h2a2 2 0 012 2v14a2 2 0 01-2 2H6a2 2 0 01-2-2V6a2 2 0 012-2h2"/>
-                  <rect x="8" y="2" width="8" height="4" rx="1" ry="1"/>
+              <button
+                @click="copyAllInfo"
+                class="icon-btn"
+                title="复制全部信息"
+              >
+                <svg
+                  width="16"
+                  height="16"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="2"
+                >
+                  <path
+                    d="M16 4h2a2 2 0 012 2v14a2 2 0 01-2 2H6a2 2 0 01-2-2V6a2 2 0 012-2h2"
+                  />
+                  <rect x="8" y="2" width="8" height="4" rx="1" ry="1" />
                 </svg>
               </button>
             </div>
@@ -425,18 +524,34 @@ onUnmounted(() => {
             <div class="section-title">
               <div class="title-bar positive"></div>
               <span>Positive Prompt</span>
-              <button v-if="!isMultiSelectMode" @click="copyToClipboard(currentEntry.prompt, '提示词')" class="mini-btn">
-                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                  <rect x="9" y="9" width="13" height="13" rx="2" ry="2"/>
-                  <path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/>
+              <button
+                v-if="!isMultiSelectMode"
+                @click="copyToClipboard(currentEntry.prompt, '提示词')"
+                class="mini-btn"
+              >
+                <svg
+                  width="12"
+                  height="12"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="2"
+                >
+                  <rect x="9" y="9" width="13" height="13" rx="2" ry="2" />
+                  <path
+                    d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"
+                  />
                 </svg>
               </button>
             </div>
             <div class="tags-wrapper">
-              <span 
-                v-for="(tag, index) in promptTags" 
-                :key="index" 
-                :class="['tag-chip positive', { 'selected': selectedTags.includes(tag) }]"
+              <span
+                v-for="(tag, index) in promptTags"
+                :key="index"
+                :class="[
+                  'tag-chip positive',
+                  { selected: selectedTags.includes(tag) }
+                ]"
                 @click="handleTagClick(tag)"
                 :title="isMultiSelectMode ? '点击选择/取消' : '点击复制'"
               >
@@ -450,18 +565,34 @@ onUnmounted(() => {
             <div class="section-title">
               <div class="title-bar negative"></div>
               <span>Negative Prompt</span>
-              <button v-if="!isMultiSelectMode" @click="copyToClipboard(negativePrompt, '反向提示词')" class="mini-btn">
-                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                  <rect x="9" y="9" width="13" height="13" rx="2" ry="2"/>
-                  <path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/>
+              <button
+                v-if="!isMultiSelectMode"
+                @click="copyToClipboard(negativePrompt, '反向提示词')"
+                class="mini-btn"
+              >
+                <svg
+                  width="12"
+                  height="12"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="2"
+                >
+                  <rect x="9" y="9" width="13" height="13" rx="2" ry="2" />
+                  <path
+                    d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"
+                  />
                 </svg>
               </button>
             </div>
             <div class="tags-wrapper">
-              <span 
-                v-for="(tag, index) in negativePromptTags" 
-                :key="index" 
-                :class="['tag-chip negative', { 'selected': selectedTags.includes(tag) }]"
+              <span
+                v-for="(tag, index) in negativePromptTags"
+                :key="index"
+                :class="[
+                  'tag-chip negative',
+                  { selected: selectedTags.includes(tag) }
+                ]"
                 @click="handleTagClick(tag)"
                 :title="isMultiSelectMode ? '点击选择/取消' : '点击复制'"
               >
@@ -485,20 +616,46 @@ onUnmounted(() => {
           </div>
 
           <!-- 时间戳 -->
-          <div class="content-section timestamp-section" v-if="currentEntry.timestamp">
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-              <circle cx="12" cy="12" r="10"/>
-              <polyline points="12 6 12 12 16 14"/>
+          <div
+            class="content-section timestamp-section"
+            v-if="currentEntry.timestamp"
+          >
+            <svg
+              width="14"
+              height="14"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="2"
+            >
+              <circle cx="12" cy="12" r="10" />
+              <polyline points="12 6 12 12 16 14" />
             </svg>
-            <span>{{ new Date(currentEntry.timestamp).toLocaleString('zh-CN') }}</span>
+            <span>{{
+              new Date(currentEntry.timestamp).toLocaleString("zh-CN")
+            }}</span>
           </div>
 
           <!-- 快速操作 -->
-          <div class="quick-actions" v-if="props.onRefresh || canDownloadOriginal">
-            <button v-if="props.onRefresh" @click="props.onRefresh" class="quick-action-btn">
-              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                <polyline points="23 4 23 10 17 10"/>
-                <path d="M20.49 15a9 9 0 11-2.12-9.36L23 10"/>
+          <div
+            class="quick-actions"
+            v-if="props.onRefresh || canDownloadOriginal"
+          >
+            <button
+              v-if="props.onRefresh"
+              @click="props.onRefresh"
+              class="quick-action-btn"
+            >
+              <svg
+                width="16"
+                height="16"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="2"
+              >
+                <polyline points="23 4 23 10 17 10" />
+                <path d="M20.49 15a9 9 0 11-2.12-9.36L23 10" />
               </svg>
               <span>刷新图片</span>
             </button>
@@ -508,12 +665,19 @@ onUnmounted(() => {
               class="quick-action-btn download"
               :disabled="isDownloading"
             >
-              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
-                <polyline points="7 10 12 15 17 10"/>
-                <line x1="12" y1="15" x2="12" y2="3"/>
+              <svg
+                width="16"
+                height="16"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="2"
+              >
+                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+                <polyline points="7 10 12 15 17 10" />
+                <line x1="12" y1="15" x2="12" y2="3" />
               </svg>
-              <span>{{ isDownloading ? 'Downloading...' : 'Download Original' }}</span>
+              <span>{{ isDownloading ? "下载中..." : "下载原图" }}</span>
             </button>
           </div>
         </div>
@@ -870,10 +1034,18 @@ onUnmounted(() => {
   animation: fadeInUp 0.4s ease backwards;
 }
 
-.content-section:nth-child(2) { animation-delay: 0.05s; }
-.content-section:nth-child(3) { animation-delay: 0.1s; }
-.content-section:nth-child(4) { animation-delay: 0.15s; }
-.content-section:nth-child(5) { animation-delay: 0.2s; }
+.content-section:nth-child(2) {
+  animation-delay: 0.05s;
+}
+.content-section:nth-child(3) {
+  animation-delay: 0.1s;
+}
+.content-section:nth-child(4) {
+  animation-delay: 0.15s;
+}
+.content-section:nth-child(5) {
+  animation-delay: 0.2s;
+}
 
 @keyframes fadeInUp {
   from {
