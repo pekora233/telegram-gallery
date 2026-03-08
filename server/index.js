@@ -94,11 +94,9 @@ async function verifyTurnstileToken(token, ip, secretKey) {
 // ========== Telegram file URL helpers ==========
 
 const TELEGRAM_OFFICIAL = 'https://api.telegram.org';
-const TELEGRAM_PROXY = 'https://tgapi.kairod.cfd';
 
-function buildUrlFromFilePath(botToken, filePath, useProxy = false) {
+function buildUrlFromFilePath(botToken, filePath) {
   if (!filePath) return null;
-  if (useProxy) return `${TELEGRAM_PROXY}/file/bot${botToken}/${filePath}`;
   return `${TELEGRAM_OFFICIAL}/file/bot${botToken}/${filePath}`;
 }
 
@@ -170,6 +168,9 @@ function parseBotTokenList(raw) {
 }
 
 const FETCH_TIMEOUT_MS = 8000;
+const TELEGRAM_FETCH_RETRIES = 2;
+const TELEGRAM_FETCH_RETRY_BASE_DELAY_MS = 250;
+const TELEGRAM_RETRYABLE_STATUS = new Set([408, 425, 429, 500, 502, 503, 504]);
 
 function fetchWithTimeout(url, opts = {}, timeoutMs = FETCH_TIMEOUT_MS) {
   const controller = new AbortController();
@@ -178,17 +179,49 @@ function fetchWithTimeout(url, opts = {}, timeoutMs = FETCH_TIMEOUT_MS) {
     .finally(() => clearTimeout(timer));
 }
 
-async function resolveTelegramFilePath(botToken, fileId, useProxy = false) {
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isRetryableTelegramStatus(status) {
+  return TELEGRAM_RETRYABLE_STATUS.has(status);
+}
+
+async function fetchTelegramWithRetry(
+  url,
+  opts = {},
+  {
+    retries = TELEGRAM_FETCH_RETRIES,
+    timeoutMs = FETCH_TIMEOUT_MS,
+    baseDelayMs = TELEGRAM_FETCH_RETRY_BASE_DELAY_MS,
+  } = {}
+) {
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      const resp = await fetchWithTimeout(url, opts, timeoutMs);
+      if (!isRetryableTelegramStatus(resp.status) || attempt === retries) {
+        return resp;
+      }
+    } catch (e) {
+      if (attempt === retries) throw e;
+    }
+
+    const delayMs = baseDelayMs * (2 ** attempt);
+    await sleep(delayMs);
+  }
+  return null;
+}
+
+async function resolveTelegramFilePath(botToken, fileId) {
   if (!botToken || !fileId) return null;
-  const cacheKey = `${useProxy ? 'proxy' : 'official'}:${botToken}:${fileId}`;
+  const cacheKey = `${botToken}:${fileId}`;
   const cached = getCachedValue(telegramPathCache, cacheKey);
   if (cached) return cached;
 
-  const base = useProxy ? TELEGRAM_PROXY : TELEGRAM_OFFICIAL;
-  const url = `${base}/bot${botToken}/getFile?file_id=${encodeURIComponent(fileId)}`;
+  const url = `${TELEGRAM_OFFICIAL}/bot${botToken}/getFile?file_id=${encodeURIComponent(fileId)}`;
 
   try {
-    const resp = await fetchWithTimeout(url);
+    const resp = await fetchTelegramWithRetry(url);
     if (!resp.ok) return null;
     const data = await resp.json().catch(() => null);
     const filePath = data?.result?.file_path || null;
@@ -674,11 +707,11 @@ async function handleFileUrl(request, env, ctx) {
   }
 
   // --- Helper: try to resolve file path and fetch image ---
-  async function tryFetch(token, useProxy) {
-    const filePath = await resolveTelegramFilePath(token, file_id, useProxy);
+  async function tryFetch(token) {
+    const filePath = await resolveTelegramFilePath(token, file_id);
     if (!filePath) return null;
-    const imageUrl = buildUrlFromFilePath(token, filePath, useProxy);
-    const imageResp = await fetchWithTimeout(imageUrl).catch(() => null);
+    const imageUrl = buildUrlFromFilePath(token, filePath);
+    const imageResp = await fetchTelegramWithRetry(imageUrl).catch(() => null);
     if (!imageResp || !imageResp.ok) return null;
     return buildImageResponse(imageResp, filePath);
   }
@@ -699,12 +732,7 @@ async function handleFileUrl(request, env, ctx) {
     for (const token of tokens) {
       if (triedTokens.has(token)) continue;
       triedTokens.add(token);
-      const [officialResult, proxyResult] = await Promise.allSettled([
-        tryFetch(token, false),
-        tryFetch(token, true),
-      ]);
-
-      const response = officialResult.value || proxyResult.value;
+      const response = await tryFetch(token);
       if (response) return response;
     }
     return null;
