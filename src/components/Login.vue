@@ -13,7 +13,8 @@ const emit = defineEmits(['login']);
 
 // Turnstile 配置 - 需要在环境变量或配置中设置
 const TURNSTILE_SITE_KEY = import.meta.env.VITE_TURNSTILE_SITE_KEY || '1x00000000000000000000AA'; // 测试用的 site key
-const HCAPTCHA_SITE_KEY = import.meta.env.VITE_HCAPTCHA_SITE_KEY || '10000000-ffff-ffff-ffff-000000000001';
+const HCAPTCHA_SITE_KEY = String(import.meta.env.VITE_HCAPTCHA_SITE_KEY || '').trim();
+const hasHCaptchaSiteKey = HCAPTCHA_SITE_KEY.length > 0;
 
 function renderTurnstile() {
   if (!window.turnstile || turnstileWidgetId.value !== null) return;
@@ -37,6 +38,10 @@ function renderTurnstile() {
 }
 
 function renderHCaptcha() {
+  if (!hasHCaptchaSiteKey) {
+    error.value = '未配置 VITE_HCAPTCHA_SITE_KEY，hCaptcha 不可用';
+    return;
+  }
   if (!window.hcaptcha || hcaptchaWidgetId.value !== null) return;
   if (!document.getElementById('hcaptcha-container')) return;
 
@@ -77,7 +82,12 @@ function resetAllCaptchas() {
 }
 
 function selectCaptchaProvider(provider) {
+  if (provider === 'hcaptcha' && !hasHCaptchaSiteKey) {
+    error.value = '未配置 VITE_HCAPTCHA_SITE_KEY，无法切换到 hCaptcha';
+    return;
+  }
   captchaProvider.value = provider;
+  error.value = '';
   if (provider === 'turnstile') {
     renderTurnstile();
   } else {
@@ -86,6 +96,10 @@ function selectCaptchaProvider(provider) {
 }
 
 onMounted(() => {
+  if (!hasHCaptchaSiteKey && import.meta.env.DEV) {
+    console.warn('[captcha] missing VITE_HCAPTCHA_SITE_KEY, hCaptcha is disabled');
+  }
+
   if (window.turnstile) {
     if (captchaProvider.value === 'turnstile') renderTurnstile();
   } else {
@@ -95,8 +109,8 @@ onMounted(() => {
   }
 
   if (window.hcaptcha) {
-    if (captchaProvider.value === 'hcaptcha') renderHCaptcha();
-  } else {
+    if (captchaProvider.value === 'hcaptcha' && hasHCaptchaSiteKey) renderHCaptcha();
+  } else if (hasHCaptchaSiteKey) {
     window.onloadHCaptchaCallback = () => {
       if (captchaProvider.value === 'hcaptcha') renderHCaptcha();
     };
@@ -225,11 +239,14 @@ async function submit() {
                 type="button"
                 class="captcha-provider-btn"
                 :class="{ active: captchaProvider === 'hcaptcha' }"
+                :disabled="!hasHCaptchaSiteKey"
+                :title="hasHCaptchaSiteKey ? 'hCaptcha' : '未配置 VITE_HCAPTCHA_SITE_KEY'"
                 @click="selectCaptchaProvider('hcaptcha')"
               >
                 hCaptcha
               </button>
             </div>
+            <p v-if="!hasHCaptchaSiteKey" class="captcha-hint">未配置 VITE_HCAPTCHA_SITE_KEY，hCaptcha 已禁用</p>
           </div>
 
           <div class="form-group">
@@ -485,6 +502,17 @@ async function submit() {
   border-color: var(--primary);
   background: rgba(99, 102, 241, 0.12);
   color: var(--text-primary);
+}
+
+.captcha-provider-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.captcha-hint {
+  margin: 0.5rem 0 0;
+  font-size: 0.75rem;
+  color: #ef4444;
 }
 
 .captcha-wrapper {
