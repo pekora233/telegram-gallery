@@ -4,51 +4,119 @@ import { ref, onMounted, onBeforeUnmount } from 'vue';
 const username = ref('');
 const password = ref('');
 const error = ref('');
+const captchaProvider = ref('turnstile');
 const turnstileToken = ref('');
+const hcaptchaToken = ref('');
 const turnstileWidgetId = ref(null);
+const hcaptchaWidgetId = ref(null);
 const emit = defineEmits(['login']);
 
 // Turnstile 配置 - 需要在环境变量或配置中设置
 const TURNSTILE_SITE_KEY = import.meta.env.VITE_TURNSTILE_SITE_KEY || '1x00000000000000000000AA'; // 测试用的 site key
+const HCAPTCHA_SITE_KEY = import.meta.env.VITE_HCAPTCHA_SITE_KEY || '10000000-ffff-ffff-ffff-000000000001';
 
 function renderTurnstile() {
-  if (window.turnstile && document.getElementById('turnstile-container')) {
-    turnstileWidgetId.value = window.turnstile.render('#turnstile-container', {
-      sitekey: TURNSTILE_SITE_KEY,
-      callback: (token) => {
-        turnstileToken.value = token;
-      },
-      'error-callback': () => {
-        error.value = '人机验证失败，请刷新页面重试';
-      },
-      theme: 'light',
-      size: 'normal',
-    });
+  if (!window.turnstile || turnstileWidgetId.value !== null) return;
+  if (!document.getElementById('turnstile-container')) return;
+
+  turnstileWidgetId.value = window.turnstile.render('#turnstile-container', {
+    sitekey: TURNSTILE_SITE_KEY,
+    callback: (token) => {
+      turnstileToken.value = token;
+    },
+    'expired-callback': () => {
+      turnstileToken.value = '';
+    },
+    'error-callback': () => {
+      error.value = '人机验证失败，请刷新页面重试';
+      turnstileToken.value = '';
+    },
+    theme: 'light',
+    size: 'normal',
+  });
+}
+
+function renderHCaptcha() {
+  if (!window.hcaptcha || hcaptchaWidgetId.value !== null) return;
+  if (!document.getElementById('hcaptcha-container')) return;
+
+  hcaptchaWidgetId.value = window.hcaptcha.render('hcaptcha-container', {
+    sitekey: HCAPTCHA_SITE_KEY,
+    callback: (token) => {
+      hcaptchaToken.value = token;
+    },
+    'expired-callback': () => {
+      hcaptchaToken.value = '';
+    },
+    'error-callback': () => {
+      error.value = 'hCaptcha verification failed, please retry.';
+      hcaptchaToken.value = '';
+    },
+    theme: 'light',
+    size: 'normal',
+  });
+}
+
+function resetTurnstile() {
+  if (window.turnstile && turnstileWidgetId.value !== null) {
+    window.turnstile.reset(turnstileWidgetId.value);
+  }
+  turnstileToken.value = '';
+}
+
+function resetHCaptcha() {
+  if (window.hcaptcha && hcaptchaWidgetId.value !== null) {
+    window.hcaptcha.reset(hcaptchaWidgetId.value);
+  }
+  hcaptchaToken.value = '';
+}
+
+function resetAllCaptchas() {
+  resetTurnstile();
+  resetHCaptcha();
+}
+
+function selectCaptchaProvider(provider) {
+  captchaProvider.value = provider;
+  if (provider === 'turnstile') {
+    renderTurnstile();
+  } else {
+    renderHCaptcha();
   }
 }
 
 onMounted(() => {
-  // 初始化 Cloudflare Turnstile
   if (window.turnstile) {
-    renderTurnstile();
+    if (captchaProvider.value === 'turnstile') renderTurnstile();
   } else {
-    // 如果 turnstile 脚本还没加载完，等待它加载
-    window.onloadTurnstileCallback = renderTurnstile;
+    window.onloadTurnstileCallback = () => {
+      if (captchaProvider.value === 'turnstile') renderTurnstile();
+    };
+  }
+
+  if (window.hcaptcha) {
+    if (captchaProvider.value === 'hcaptcha') renderHCaptcha();
+  } else {
+    window.onloadHCaptchaCallback = () => {
+      if (captchaProvider.value === 'hcaptcha') renderHCaptcha();
+    };
   }
 });
 
 onBeforeUnmount(() => {
-  if (window.turnstile && turnstileWidgetId.value !== null) {
+  if (window.turnstile && turnstileWidgetId.value !== null && typeof window.turnstile.remove === 'function') {
     window.turnstile.remove(turnstileWidgetId.value);
+  }
+  if (window.hcaptcha && hcaptchaWidgetId.value !== null && typeof window.hcaptcha.remove === 'function') {
+    window.hcaptcha.remove(hcaptchaWidgetId.value);
   }
 });
 
 async function submit() {
   error.value = '';
 
-  // 验证 Turnstile token
-  if (!turnstileToken.value) {
-    error.value = '请完成人机验证';
+  if (!turnstileToken.value && !hcaptchaToken.value) {
+    error.value = '请完成 Turnstile 或 hCaptcha 人机验证';
     return;
   }
 
@@ -59,28 +127,21 @@ async function submit() {
       body: JSON.stringify({
         username: username.value,
         password: password.value,
-        turnstileToken: turnstileToken.value
+        turnstileToken: turnstileToken.value,
+        hcaptchaToken: hcaptchaToken.value,
       }),
     });
     const j = await resp.json();
     if (!resp.ok) {
       error.value = j.error || '登录失败';
-      // 重置 Turnstile
-      if (window.turnstile && turnstileWidgetId.value !== null) {
-        window.turnstile.reset(turnstileWidgetId.value);
-        turnstileToken.value = '';
-      }
+      resetAllCaptchas();
       return;
     }
     localStorage.setItem('gallery_token', j.token);
     emit('login');
   } catch (e) {
     error.value = String(e);
-    // 重置 Turnstile
-    if (window.turnstile && turnstileWidgetId.value !== null) {
-      window.turnstile.reset(turnstileWidgetId.value);
-      turnstileToken.value = '';
-    }
+    resetAllCaptchas();
   }
 }
 </script>
@@ -150,9 +211,30 @@ async function submit() {
             />
           </div>
 
-          <!-- Cloudflare Turnstile 人机验证 -->
           <div class="form-group">
-            <div id="turnstile-container" class="turnstile-wrapper"></div>
+            <div class="captcha-provider-switch">
+              <button
+                type="button"
+                class="captcha-provider-btn"
+                :class="{ active: captchaProvider === 'turnstile' }"
+                @click="selectCaptchaProvider('turnstile')"
+              >
+                Turnstile
+              </button>
+              <button
+                type="button"
+                class="captcha-provider-btn"
+                :class="{ active: captchaProvider === 'hcaptcha' }"
+                @click="selectCaptchaProvider('hcaptcha')"
+              >
+                hCaptcha
+              </button>
+            </div>
+          </div>
+
+          <div class="form-group">
+            <div v-show="captchaProvider === 'turnstile'" id="turnstile-container" class="captcha-wrapper"></div>
+            <div v-show="captchaProvider === 'hcaptcha'" id="hcaptcha-container" class="captcha-wrapper"></div>
           </div>
 
           <!-- 错误提示 -->
@@ -375,8 +457,37 @@ async function submit() {
   box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.1);
 }
 
-/* Turnstile 容器 */
-.turnstile-wrapper {
+/* Captcha switch and container */
+.captcha-provider-switch {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.5rem;
+}
+
+.captcha-provider-btn {
+  height: 2.25rem;
+  border: 1px solid var(--border-color);
+  border-radius: 0.625rem;
+  background: var(--bg-secondary);
+  color: var(--text-secondary);
+  font-size: 0.8125rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.captcha-provider-btn:hover {
+  border-color: var(--primary);
+  color: var(--text-primary);
+}
+
+.captcha-provider-btn.active {
+  border-color: var(--primary);
+  background: rgba(99, 102, 241, 0.12);
+  color: var(--text-primary);
+}
+
+.captcha-wrapper {
   display: flex;
   justify-content: center;
   padding: 0.5rem 0;
@@ -509,3 +620,4 @@ async function submit() {
   }
 }
 </style>
+

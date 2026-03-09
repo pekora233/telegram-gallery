@@ -28,6 +28,6 @@
      * Environment Variables (secrets)
      * Set via: wrangler secret put <KEY>
      * Required secrets: MONGO_URI, GALLERY_USER, GALLERY_PASS, JWT_SECRET, BOT_TOKEN
-     * Optional secrets: TURNSTILE_SECRET_KEY
+     * Optional secrets: TURNSTILE_SECRET_KEY, HCAPTCHA_SECRET_KEY
      */
 }

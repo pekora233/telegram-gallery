@@ -73,22 +73,49 @@ async function jwtVerify(token, secret) {
   return payload;
 }
 
-// ========== Turnstile verification ==========
+// ========== CAPTCHA verification ==========
 
 async function verifyTurnstileToken(token, ip, secretKey) {
-  if (!secretKey) return true; // skip in dev
+  if (!token || !secretKey) return false;
 
-  const response = await fetch('https://challenges.cloudflare.com/turnstile/v0/siteverify', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      secret: secretKey,
-      response: token,
-      remoteip: ip,
-    }),
-  });
-  const data = await response.json();
-  return data.success;
+  try {
+    const response = await fetch('https://challenges.cloudflare.com/turnstile/v0/siteverify', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        secret: secretKey,
+        response: token,
+        remoteip: ip,
+      }),
+    });
+    if (!response.ok) return false;
+    const data = await response.json().catch(() => null);
+    return Boolean(data?.success);
+  } catch (e) {
+    return false;
+  }
+}
+
+async function verifyHCaptchaToken(token, ip, secretKey) {
+  if (!token || !secretKey) return false;
+
+  try {
+    const body = new URLSearchParams();
+    body.set('secret', secretKey);
+    body.set('response', token);
+    if (ip) body.set('remoteip', ip);
+
+    const response = await fetch('https://hcaptcha.com/siteverify', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: body.toString(),
+    });
+    if (!response.ok) return false;
+    const data = await response.json().catch(() => null);
+    return Boolean(data?.success);
+  } catch (e) {
+    return false;
+  }
 }
 
 // ========== Telegram file URL helpers ==========
@@ -374,17 +401,31 @@ async function handleLogin(request, env) {
   }
 
   const body = await request.json().catch(() => ({}));
-  const { username, password, turnstileToken } = body;
+  const { username, password, turnstileToken, hcaptchaToken } = body;
 
   const USER = env.GALLERY_USER || 'admin';
   const PASS = env.GALLERY_PASS || 'password';
   const SECRET = env.JWT_SECRET || 'change-me';
+  const hasTurnstileSecret = Boolean(env.TURNSTILE_SECRET_KEY);
+  const hasHCaptchaSecret = Boolean(env.HCAPTCHA_SECRET_KEY);
+  const captchaEnabled = hasTurnstileSecret || hasHCaptchaSecret;
 
-  // Verify Turnstile
-  if (turnstileToken) {
+  // Verify either captcha provider. One successful verification is enough.
+  if (captchaEnabled) {
     const clientIp = request.headers.get('cf-connecting-ip') ||
       request.headers.get('x-forwarded-for')?.split(',')[0] || '';
-    const isValid = await verifyTurnstileToken(turnstileToken, clientIp, env.TURNSTILE_SECRET_KEY);
+
+    const hasCaptchaToken = Boolean(turnstileToken || hcaptchaToken);
+    if (!hasCaptchaToken) {
+      return jsonResponse({ error: 'Please complete one captcha challenge.' }, 403);
+    }
+    let isValid = false;
+    if (turnstileToken && hasTurnstileSecret) {
+      isValid = await verifyTurnstileToken(turnstileToken, clientIp, env.TURNSTILE_SECRET_KEY);
+    }
+    if (!isValid && hcaptchaToken && hasHCaptchaSecret) {
+      isValid = await verifyHCaptchaToken(hcaptchaToken, clientIp, env.HCAPTCHA_SECRET_KEY);
+    }
     if (!isValid) {
       return jsonResponse({ error: '人机验证失败，请重试' }, 403);
     }
