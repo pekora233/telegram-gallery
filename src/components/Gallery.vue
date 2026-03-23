@@ -2190,6 +2190,7 @@ onUnmounted(() => {
                   v-for="(tag, idx) in getEntryTags(entry).slice(0, 5)"
                   :key="idx"
                   class="tag"
+                  :title="tag"
                   :style="{
                     backgroundColor: getTagColor(tag).bg,
                     color: getTagColor(tag).text,
@@ -2897,14 +2898,24 @@ onUnmounted(() => {
 }
 
 .tag {
-  display: inline-block;
+  display: -webkit-box;
+  max-width: 100%;
+  min-width: 0;
   padding: 0.25rem 0.5rem;
   font-size: 0.75rem;
   font-weight: 600;
-  line-height: 1.2;
+  line-height: 1.3;
   border-radius: 0.375rem;
   border: 1.5px solid;
   transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+  box-sizing: border-box;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: normal;
+  vertical-align: top;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  overflow-wrap: anywhere;
 }
 
 .tag:hover {

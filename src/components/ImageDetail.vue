@@ -18,6 +18,9 @@ const copySuccess = ref("");
 let lightbox = null;
 let lightboxDataSource = [];
 const PHOTOSWIPE_AUTO_LOAD_THRESHOLD = 5;
+const LONG_PROMPT_MIN_LENGTH = 120;
+const LONG_PROMPT_MIN_AVG_SEGMENT = 18;
+const LONG_PROMPT_SEGMENT_LENGTH = 28;
 
 const currentEntry = computed(() => props.entries[props.currentIndex]);
 
@@ -58,28 +61,60 @@ const negativePrompt = computed(() => {
   return currentEntry.value?.metadata?.negative_prompt || null;
 });
 
-const promptTags = computed(() => {
-  const prompt = currentEntry.value?.prompt;
-  if (!prompt) return [];
-  return prompt
-    .split(",")
-    .map((tag) => tag.trim())
-    .filter((tag) => tag.length > 0);
-});
+function splitPromptSegments(prompt) {
+  return String(prompt || "")
+    .replace(/[()]/g, "")
+    .split(/[,\n，]+/)
+    .map((segment) => segment.trim())
+    .filter((segment) => segment.length > 0);
+}
 
-const negativePromptTags = computed(() => {
-  const prompt = currentEntry.value?.metadata?.negative_prompt;
-  if (!prompt) return [];
-  return prompt
-    .split(",")
-    .map((tag) => tag.trim())
-    .filter((tag) => tag.length > 0);
-});
+function buildPromptDisplay(prompt) {
+  const text = String(prompt || "").trim();
+  if (!text) {
+    return {
+      text: "",
+      tags: [],
+      isLongText: false,
+    };
+  }
+
+  const tags = splitPromptSegments(text);
+  const totalTagLength = tags.reduce((sum, tag) => sum + tag.length, 0);
+  const avgTagLength = tags.length ? totalTagLength / tags.length : 0;
+  const longTagCount = tags.filter((tag) => tag.length >= LONG_PROMPT_SEGMENT_LENGTH).length;
+  const hasLineBreak = /\r?\n/.test(text);
+  const hasParagraphPunctuation = /[。；：！？]/.test(text);
+
+  const isLongText =
+    hasLineBreak ||
+    text.length >= 220 ||
+    (text.length >= LONG_PROMPT_MIN_LENGTH && tags.length <= 4) ||
+    (text.length >= LONG_PROMPT_MIN_LENGTH && avgTagLength >= LONG_PROMPT_MIN_AVG_SEGMENT) ||
+    (text.length >= 90 && hasParagraphPunctuation && avgTagLength >= 12) ||
+    (text.length >= 100 && longTagCount >= Math.max(2, Math.ceil(tags.length * 0.4)));
+
+  return {
+    text,
+    tags: isLongText ? [] : tags,
+    isLongText,
+  };
+}
+
+const promptDisplay = computed(() => buildPromptDisplay(currentEntry.value?.prompt));
+const negativePromptDisplay = computed(() => buildPromptDisplay(negativePrompt.value));
+
+const promptTags = computed(() => promptDisplay.value.tags);
+const negativePromptTags = computed(() => negativePromptDisplay.value.tags);
+const hasSelectableTags = computed(() =>
+  promptTags.value.length > 0 || negativePromptTags.value.length > 0
+);
 
 const isMultiSelectMode = ref(false);
 const selectedTags = ref([]);
 
 function toggleMultiSelect() {
+  if (!hasSelectableTags.value) return;
   isMultiSelectMode.value = !isMultiSelectMode.value;
   if (!isMultiSelectMode.value) {
     selectedTags.value = [];
@@ -113,6 +148,12 @@ watch(
     selectedTags.value = [];
   }
 );
+
+watch(hasSelectableTags, (enabled) => {
+  if (enabled || !isMultiSelectMode.value) return;
+  isMultiSelectMode.value = false;
+  selectedTags.value = [];
+});
 
 async function copyToClipboard(text, label) {
   try {
@@ -458,6 +499,7 @@ onUnmounted(() => {
             </div>
             <div class="toolbar-right">
               <button
+                v-if="hasSelectableTags"
                 @click="toggleMultiSelect"
                 :class="['icon-btn', { active: isMultiSelectMode }]"
                 title="多选模式"
@@ -477,7 +519,7 @@ onUnmounted(() => {
                 </svg>
               </button>
               <button
-                v-if="isMultiSelectMode"
+                v-if="isMultiSelectMode && hasSelectableTags"
                 @click="copySelected"
                 :class="['icon-btn', 'success']"
                 :disabled="selectedTags.length === 0"
@@ -520,12 +562,11 @@ onUnmounted(() => {
           </div>
 
           <!-- 正向提示词 -->
-          <div class="content-section" v-if="promptTags.length">
+          <div class="content-section" v-if="promptDisplay.text">
             <div class="section-title">
               <div class="title-bar positive"></div>
               <span>Positive Prompt</span>
               <button
-                v-if="!isMultiSelectMode"
                 @click="copyToClipboard(currentEntry.prompt, '提示词')"
                 class="mini-btn"
               >
@@ -544,7 +585,14 @@ onUnmounted(() => {
                 </svg>
               </button>
             </div>
-            <div class="tags-wrapper">
+            <div v-if="promptDisplay.isLongText" class="prompt-text-box positive">
+              <div class="prompt-text-meta">
+                <span class="prompt-text-badge">Long Prompt</span>
+                <span class="prompt-text-hint">Select any part, or copy the full text.</span>
+              </div>
+              <pre class="prompt-text-content">{{ promptDisplay.text }}</pre>
+            </div>
+            <div v-else class="tags-wrapper">
               <span
                 v-for="(tag, index) in promptTags"
                 :key="index"
@@ -561,12 +609,11 @@ onUnmounted(() => {
           </div>
 
           <!-- 负向提示词 -->
-          <div class="content-section" v-if="negativePromptTags.length">
+          <div class="content-section" v-if="negativePromptDisplay.text">
             <div class="section-title">
               <div class="title-bar negative"></div>
               <span>Negative Prompt</span>
               <button
-                v-if="!isMultiSelectMode"
                 @click="copyToClipboard(negativePrompt, '反向提示词')"
                 class="mini-btn"
               >
@@ -585,7 +632,14 @@ onUnmounted(() => {
                 </svg>
               </button>
             </div>
-            <div class="tags-wrapper">
+            <div v-if="negativePromptDisplay.isLongText" class="prompt-text-box negative">
+              <div class="prompt-text-meta">
+                <span class="prompt-text-badge">Long Prompt</span>
+                <span class="prompt-text-hint">Select any part, or copy the full text.</span>
+              </div>
+              <pre class="prompt-text-content">{{ negativePromptDisplay.text }}</pre>
+            </div>
+            <div v-else class="tags-wrapper">
               <span
                 v-for="(tag, index) in negativePromptTags"
                 :key="index"
@@ -1107,6 +1161,74 @@ onUnmounted(() => {
   background: var(--primary);
   color: white;
   transform: scale(1.05);
+}
+
+.prompt-text-box {
+  padding: 0.95rem 1rem 1rem;
+  border-radius: 0.875rem;
+  border: 1px solid transparent;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.08);
+}
+
+.prompt-text-box.positive {
+  background:
+    linear-gradient(180deg, rgba(59, 130, 246, 0.12) 0%, rgba(59, 130, 246, 0.04) 100%),
+    var(--bg-tertiary);
+  border-color: rgba(59, 130, 246, 0.16);
+}
+
+.prompt-text-box.negative {
+  background:
+    linear-gradient(180deg, rgba(239, 68, 68, 0.12) 0%, rgba(239, 68, 68, 0.04) 100%),
+    var(--bg-tertiary);
+  border-color: rgba(239, 68, 68, 0.16);
+}
+
+.prompt-text-meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  margin-bottom: 0.75rem;
+  flex-wrap: wrap;
+}
+
+.prompt-text-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 0.25rem 0.55rem;
+  border-radius: 999px;
+  font-size: 0.688rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.prompt-text-box.positive .prompt-text-badge {
+  background: rgba(59, 130, 246, 0.14);
+  color: #1d4ed8;
+}
+
+.prompt-text-box.negative .prompt-text-badge {
+  background: rgba(239, 68, 68, 0.14);
+  color: #b91c1c;
+}
+
+.prompt-text-hint {
+  font-size: 0.75rem;
+  color: var(--text-muted);
+}
+
+.prompt-text-content {
+  margin: 0;
+  font-family: inherit;
+  font-size: 0.875rem;
+  line-height: 1.75;
+  color: var(--text-primary);
+  white-space: pre-wrap;
+  word-break: break-word;
+  user-select: text;
+  cursor: text;
 }
 
 /* 标签容器 */
