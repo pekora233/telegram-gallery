@@ -25,9 +25,19 @@
 	},
 	"keep_vars": true
 	/**
-     * Environment Variables (secrets)
-     * Set via: wrangler secret put <KEY>
-     * Required secrets: MONGO_URI, GALLERY_USER, GALLERY_PASS, JWT_SECRET, BOT_TOKEN
-     * Optional secrets: TURNSTILE_SECRET_KEY, HCAPTCHA_SECRET_KEY
+	* Environment Variables (secrets)
+	* Set via: wrangler secret put <KEY>
+	* Required secrets for MongoDB mode: MONGO_URI, GALLERY_USER, GALLERY_PASS, JWT_SECRET, BOT_TOKEN
+	* D1 should be configured as a binding named DB
+	* Example:
+	* // "d1_databases": [
+	* //   {
+	* //     "binding": "DB",
+	* //     "database_name": "telegram-gallery",
+	* //     "database_id": "REPLACE_WITH_YOUR_D1_DATABASE_ID"
+	* //   }
+	* // ]
+	* Optional secrets: TURNSTILE_SECRET_KEY, HCAPTCHA_SECRET_KEY
+	* When DB is bound, the Worker uses Cloudflare D1 and skips MongoDB.
      */
 }

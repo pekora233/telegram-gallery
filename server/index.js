@@ -1,4 +1,4 @@
-import { MongoClient, ObjectId } from 'mongodb';
+﻿import { MongoClient, ObjectId } from 'mongodb';
 
 // ========== JWT helpers (Web Crypto API, CF Workers compatible) ==========
 
@@ -267,8 +267,114 @@ async function resolveTelegramFilePath(botToken, fileId) {
   }
 }
 
-async function lookupFileMetaFromDb(mongoUri, fileId) {
-  if (!mongoUri || !fileId) return null;
+const GALLERY_D1_TABLE = 'gallery_archive';
+
+function getD1Database(env) {
+  return env?.DB || null;
+}
+
+function getGalleryDbMode(env) {
+  if (getD1Database(env)) return 'd1';
+  if (env?.MONGO_URI) return 'mongo';
+  return null;
+}
+
+function bindD1Statement(env, sql, params = []) {
+  const database = getD1Database(env);
+  if (!database) {
+    throw new Error('D1 not configured');
+  }
+
+  const statement = database.prepare(sql);
+  return params.length > 0 ? statement.bind(...params) : statement;
+}
+
+async function queryD1(env, sql, params = []) {
+  const result = await bindD1Statement(env, sql, params).all();
+  return result;
+}
+
+async function executeD1(env, sql, params = []) {
+  return bindD1Statement(env, sql, params).run();
+}
+
+function getD1Rows(result) {
+  if (!result?.results || !Array.isArray(result.results)) return [];
+  return result.results;
+}
+
+function getD1Changes(result) {
+  return Number(result?.meta?.changes || 0);
+}
+
+function parseJsonObject(value, fallback = {}) {
+  if (!value) return fallback;
+  if (typeof value === 'object') return value;
+  if (typeof value !== 'string') return fallback;
+  try {
+    const parsed = JSON.parse(value);
+    return parsed && typeof parsed === 'object' ? parsed : fallback;
+  } catch (e) {
+    return fallback;
+  }
+}
+
+function rowToGalleryItem(row) {
+  const metadata = parseJsonObject(row.metadata_json || row.metadata || {});
+  const telegram = parseJsonObject(row.telegram_json || row.telegram || {});
+  const id = row.mongo_id || row._id || row.id || '';
+
+  return {
+    id: String(id),
+    prompt: row.prompt || null,
+    metadata,
+    telegram: {
+      chat_id: row.chat_id || telegram.chat_id || null,
+      file_id: row.file_id || telegram.file_id || null,
+      file_id_lossy: row.file_id_lossy || telegram.file_id_lossy || null,
+      file_id_format: row.file_id_format || telegram.file_id_format || null,
+      file_id_lossy_format: row.file_id_lossy_format || telegram.file_id_lossy_format || null,
+      prev_file_id_format: row.prev_file_id_format || telegram.prev_file_id_format || null,
+    },
+    timestamp: row.timestamp_iso || row.timestamp || null,
+  };
+}
+
+function rowToFileMeta(row) {
+  if (!row) return null;
+  const telegram = parseJsonObject(row.telegram_json || row.telegram || {});
+  const id = row.mongo_id || row._id || row.id || '';
+  return {
+    botToken: row.bot_token || telegram.bot_token || null,
+    docId: String(id) || null,
+    dbFormat: normalizeExt(row.file_id_format) || normalizeExt(row.file_id_lossy_format) || null,
+  };
+}
+
+async function lookupFileMetaFromDb(env, fileId) {
+  if (!fileId) return null;
+
+  if (getD1Database(env)) {
+    try {
+      const result = await queryD1(
+        env,
+        `
+          SELECT mongo_id, bot_token, file_id, file_id_lossy, file_id_format, file_id_lossy_format, telegram_json
+          FROM ${GALLERY_D1_TABLE}
+          WHERE file_id = ? OR file_id_lossy = ?
+          LIMIT 1
+        `,
+        [fileId, fileId]
+      );
+      return rowToFileMeta(getD1Rows(result)[0] || null);
+    } catch (e) {
+      return null;
+    }
+  }
+
+  const mongoUri = env?.MONGO_URI || null;
+  if (!mongoUri) return null;
+
   try {
     return await withMongo(mongoUri, async (db) => {
       const collection = db.collection('gallery');
@@ -346,11 +452,11 @@ async function withMongo(mongoUri, fn) {
   }
 }
 
-async function getCachedEstimatedGalleryCount(collection) {
+async function getCachedEstimatedGalleryCount(fetchCount) {
   if (galleryCountCacheValue !== null && galleryCountCacheExpiresAt > Date.now()) {
     return galleryCountCacheValue;
   }
-  const total = await collection.estimatedDocumentCount();
+  const total = await fetchCount();
   galleryCountCacheValue = total;
   galleryCountCacheExpiresAt = Date.now() + GALLERY_COUNT_CACHE_TTL_MS;
   return total;
@@ -456,6 +562,219 @@ async function handleGallery(request, env) {
     return jsonResponse({ error: 'Unauthorized' }, 401);
   }
 
+  const dbMode = getGalleryDbMode(env);
+  if (!dbMode) {
+    return jsonResponse({ error: 'No database configured' }, 500);
+  }
+
+  if (dbMode === 'd1') {
+    if (request.method === 'DELETE') {
+      const body = await request.json().catch(() => ({}));
+      const id = body?.id;
+      if (!id) {
+        return jsonResponse({ error: 'Missing id' }, 400);
+      }
+      try {
+        const result = await executeD1(env, `DELETE FROM ${GALLERY_D1_TABLE} WHERE mongo_id = ?`, [id]);
+        if (getD1Changes(result) === 1) {
+          invalidateCachedGalleryCount();
+          return jsonResponse({ ok: true, deletedId: id });
+        }
+        return jsonResponse({ error: 'Not found' }, 404);
+      } catch (e) {
+        return jsonResponse({ error: String(e) }, 500);
+      }
+    }
+
+    const url = new URL(request.url);
+    const limitRaw = url.searchParams.get('limit');
+    const cursorRaw = url.searchParams.get('cursor');
+    const pageRaw = url.searchParams.get('page');
+    const pageSizeRaw = url.searchParams.get('pageSize');
+    const sortRaw = url.searchParams.get('sort');
+    const pageSpanRaw = url.searchParams.get('pageSpan');
+    const batchCursorRaw = url.searchParams.get('batchCursor');
+    const cursor = typeof cursorRaw === 'string' ? cursorRaw.trim() : '';
+    const ascending = sortRaw === 'asc';
+    const wantsNumberedPagination = pageRaw !== null || pageSizeRaw !== null;
+    const wantsPagination = limitRaw !== null || Boolean(cursor);
+    const decodeCursor = (rawCursor) => {
+      if (!rawCursor) return null;
+
+      const legacySep = rawCursor.indexOf('|');
+      if (legacySep > 0) {
+        rawCursor = rawCursor.slice(0, legacySep);
+      }
+
+      if (rawCursor.startsWith('d:')) {
+        const date = new Date(rawCursor.slice(2));
+        if (!Number.isNaN(date.getTime())) return date;
+        return rawCursor.slice(2);
+      }
+
+      if (rawCursor.startsWith('r:')) {
+        return rawCursor.slice(2);
+      }
+
+      const date = new Date(rawCursor);
+      if (!Number.isNaN(date.getTime())) return date;
+      return rawCursor;
+    };
+    const encodeCursor = (value) => {
+      if (value instanceof Date) {
+        return `d:${value.toISOString()}`;
+      }
+      return `r:${String(value ?? '')}`;
+    };
+    const selectColumns = 'mongo_id, prompt, metadata_json, telegram_json, timestamp_iso';
+    const orderDirection = ascending ? 'ASC' : 'DESC';
+    const compareOperator = ascending ? '>' : '<';
+
+    if (wantsNumberedPagination) {
+      const parsedPage = parseInt(String(pageRaw ?? ''), 10);
+      const parsedPageSize = parseInt(String(pageSizeRaw ?? ''), 10);
+      const parsedPageSpan = parseInt(String(pageSpanRaw ?? ''), 10);
+      const pageSize = Number.isFinite(parsedPageSize)
+        ? Math.max(1, Math.min(parsedPageSize, 200))
+        : 60;
+      const pageSpan = Number.isFinite(parsedPageSpan)
+        ? Math.max(1, Math.min(parsedPageSpan, GALLERY_MAX_PAGE_SPAN))
+        : 1;
+      const requestedPage = Number.isFinite(parsedPage)
+        ? Math.max(1, parsedPage)
+        : 1;
+
+      const totalCount = await getCachedEstimatedGalleryCount(async () => {
+        const result = await queryD1(env, `SELECT COUNT(*) AS total FROM ${GALLERY_D1_TABLE}`);
+        const row = getD1Rows(result)[0] || null;
+        return Number(row?.total || 0);
+      });
+      const totalPages = Math.max(1, Math.ceil(totalCount / pageSize));
+      const page = Math.min(requestedPage, totalPages);
+      const batchStartPage = Math.floor((page - 1) / pageSpan) * pageSpan + 1;
+      const batchEndPage = Math.min(totalPages, batchStartPage + pageSpan - 1);
+      const batchLimit = (batchEndPage - batchStartPage + 1) * pageSize;
+
+      const batchCursor = typeof batchCursorRaw === 'string' ? batchCursorRaw.trim() : '';
+      let rows;
+      if (batchCursor) {
+        const cursorValue = decodeCursor(batchCursor);
+        const result = await queryD1(
+          env,
+          `
+            SELECT ${selectColumns}
+            FROM ${GALLERY_D1_TABLE}
+            WHERE timestamp_iso ${compareOperator} ?
+            ORDER BY timestamp_iso ${orderDirection}
+            LIMIT ?
+          `,
+          [cursorValue instanceof Date ? cursorValue.toISOString() : cursorValue, batchLimit]
+        );
+        rows = getD1Rows(result);
+      } else {
+        const skip = (batchStartPage - 1) * pageSize;
+        const result = await queryD1(
+          env,
+          `
+            SELECT ${selectColumns}
+            FROM ${GALLERY_D1_TABLE}
+            ORDER BY timestamp_iso ${orderDirection}
+            LIMIT ? OFFSET ?
+          `,
+          [batchLimit, skip]
+        );
+        rows = getD1Rows(result);
+      }
+
+      const mappedItems = rows.map(rowToGalleryItem);
+      const pages = {};
+      for (let p = batchStartPage; p <= batchEndPage; p += 1) {
+        const pageOffset = (p - batchStartPage) * pageSize;
+        pages[String(p)] = mappedItems.slice(pageOffset, pageOffset + pageSize);
+      }
+      const items = pages[String(page)] || [];
+      const lastRow = rows[rows.length - 1];
+      const batchEndCursor = lastRow ? encodeCursor(lastRow.timestamp_iso) : null;
+
+      return jsonResponse(
+        {
+          items,
+          pages,
+          page,
+          pageSize,
+          pageSpan,
+          batchStartPage,
+          batchEndPage,
+          batchEndCursor,
+          totalCount,
+          totalPages,
+          hasMore: page < totalPages,
+        },
+        200,
+        { 'Cache-Control': 'public, max-age=30' }
+      );
+    }
+
+    if (wantsPagination) {
+      const parsedLimit = parseInt(String(limitRaw ?? ''), 10);
+      const limit = Number.isFinite(parsedLimit)
+        ? Math.max(1, Math.min(parsedLimit, 200))
+        : 60;
+
+      let whereClause = '';
+      const params = [];
+      if (cursor) {
+        const cursorValue = decodeCursor(cursor);
+        whereClause = `WHERE timestamp_iso ${compareOperator} ?`;
+        params.push(cursorValue instanceof Date ? cursorValue.toISOString() : cursorValue);
+      }
+
+      const result = await queryD1(
+        env,
+        `
+          SELECT ${selectColumns}
+          FROM ${GALLERY_D1_TABLE}
+          ${whereClause}
+          ORDER BY timestamp_iso ${orderDirection}
+          LIMIT ?
+        `,
+        [...params, limit + 1]
+      );
+      const docs = getD1Rows(result);
+
+      const hasMore = docs.length > limit;
+      const pageDocs = hasMore ? docs.slice(0, limit) : docs;
+      const items = pageDocs.map(rowToGalleryItem);
+      const lastRow = pageDocs[pageDocs.length - 1];
+      const nextCursor = hasMore && lastRow
+        ? encodeCursor(lastRow.timestamp_iso)
+        : null;
+
+      return jsonResponse(
+        { items, hasMore, nextCursor, limit },
+        200,
+        { 'Cache-Control': 'public, max-age=60' }
+      );
+    }
+
+    const result = await queryD1(
+      env,
+      `
+        SELECT ${selectColumns}
+        FROM ${GALLERY_D1_TABLE}
+        ORDER BY timestamp_iso DESC
+        LIMIT 200
+      `
+    );
+    const docs = getD1Rows(result);
+
+    return jsonResponse(
+      docs.map(rowToGalleryItem),
+      200,
+      { 'Cache-Control': 'public, max-age=60' }
+    );
+  }
+
   const MONGO_URI = env.MONGO_URI;
   if (!MONGO_URI) {
     return jsonResponse({ error: 'MONGO_URI not configured' }, 500);
@@ -556,7 +875,7 @@ async function handleGallery(request, env) {
         ? Math.max(1, parsedPage)
         : 1;
 
-      const totalCount = await getCachedEstimatedGalleryCount(collection);
+      const totalCount = await getCachedEstimatedGalleryCount(async () => collection.estimatedDocumentCount());
       const totalPages = Math.max(1, Math.ceil(totalCount / pageSize));
       const page = Math.min(requestedPage, totalPages);
       const batchStartPage = Math.floor((page - 1) / pageSpan) * pageSpan + 1;
@@ -693,7 +1012,6 @@ async function handleFileUrl(request, env, ctx) {
   // --- Resolve metadata (lazy DB fallback) ---
   const filenameHint = url.searchParams.get('filename_hint') || '';
   const hintedExt = extFromFilenameHint(filenameHint);
-  const MONGO_URI = env.MONGO_URI || null;
   const envTokens = [
     ...parseBotTokenList(env.BOT_TOKENS),
     ...parseBotTokenList(env.BOT_TOKEN),
@@ -704,8 +1022,8 @@ async function handleFileUrl(request, env, ctx) {
   const triedTokens = new Set();
 
   const readDbMeta = async () => {
-    if (!MONGO_URI || dbMeta) return;
-    dbMeta = await lookupFileMetaFromDb(MONGO_URI, file_id);
+    if (dbMeta) return;
+    dbMeta = await lookupFileMetaFromDb(env, file_id);
     if (dbMeta) {
       setCachedValue(fileMetaCache, file_id, dbMeta, FILE_META_CACHE_TTL_MS, FILE_META_CACHE_MAX_ITEMS);
       dbFormat = normalizeExt(dbMeta.dbFormat) || hintedExt;
@@ -827,6 +1145,60 @@ async function handleCategories(request, env) {
     return jsonResponse({ error: 'Unauthorized' }, 401);
   }
 
+  const dbMode = getGalleryDbMode(env);
+  if (!dbMode) {
+    return jsonResponse({ error: 'No database configured' }, 500);
+  }
+
+  if (dbMode === 'd1') {
+    const result = await queryD1(
+      env,
+      `
+        SELECT mongo_id, prompt, timestamp_iso
+        FROM ${GALLERY_D1_TABLE}
+        ORDER BY mongo_id DESC
+      `
+    );
+    const docs = getD1Rows(result);
+
+    const THRESHOLD = 0.85;
+    const categories = [];
+
+    for (const doc of docs) {
+      const tags = parseTags(doc.prompt);
+      if (tags.length === 0) continue;
+      const tagSet = new Set(tags);
+      let matched = false;
+
+      for (const cat of categories) {
+        if (jaccardSimilarity(tagSet, cat.tagSet) >= THRESHOLD) {
+          cat.items.push(String(doc.mongo_id));
+          cat.count++;
+          matched = true;
+          break;
+        }
+      }
+
+      if (!matched) {
+        categories.push({
+          id: categories.length,
+          tags,
+          tagSet,
+          count: 1,
+          items: [String(doc.mongo_id)],
+        });
+      }
+    }
+
+    const resultCategories = categories.map(({ tagSet, ...rest }) => rest);
+
+    return jsonResponse({
+      categories: resultCategories,
+      totalItems: docs.length,
+      totalCategories: categories.length,
+    }, 200, { 'Cache-Control': 'public, max-age=120' });
+  }
+
   const MONGO_URI = env.MONGO_URI;
   if (!MONGO_URI) {
     return jsonResponse({ error: 'MONGO_URI not configured' }, 500);
@@ -892,6 +1264,47 @@ async function handleStats(request, env) {
     await jwtVerify(auth, SECRET);
   } catch (e) {
     return jsonResponse({ error: 'Unauthorized' }, 401);
+  }
+
+  const dbMode = getGalleryDbMode(env);
+  if (!dbMode) {
+    return jsonResponse({ error: 'No database configured' }, 500);
+  }
+
+  if (dbMode === 'd1') {
+    const result = await queryD1(
+      env,
+      `
+        SELECT mongo_id, prompt, metadata_json, telegram_json, timestamp_iso, model
+        FROM ${GALLERY_D1_TABLE}
+        ORDER BY mongo_id DESC
+      `
+    );
+    const docs = getD1Rows(result);
+
+    const models = {};
+    let oldest = null;
+    let newest = null;
+
+    const items = docs.map((row) => {
+      const item = rowToGalleryItem(row);
+      const ts = item.timestamp;
+      if (ts) {
+        if (!oldest || ts < oldest) oldest = ts;
+        if (!newest || ts > newest) newest = ts;
+      }
+      const model = row.model || item.metadata?.model || 'unknown';
+      models[model] = (models[model] || 0) + 1;
+      return item;
+    });
+
+    return jsonResponse({
+      totalItems: docs.length,
+      oldestTimestamp: oldest,
+      newestTimestamp: newest,
+      models,
+      items,
+    }, 200, { 'Cache-Control': 'public, max-age=60' });
   }
 
   const MONGO_URI = env.MONGO_URI;

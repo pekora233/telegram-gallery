@@ -19,6 +19,10 @@ This template should help get you started developing with Vue 3 in Vite.
 
 See [Vite Configuration Reference](https://vite.dev/config/).
 
+## Database
+
+The Worker supports MongoDB and Cloudflare D1. If a D1 binding named `DB` exists, the backend uses D1 first and does not connect to MongoDB.
+
 ## Project Setup
 
 ```sh
