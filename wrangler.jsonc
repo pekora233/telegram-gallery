@@ -23,11 +23,18 @@
 	"placement": {
 		"mode": "smart"
 	},
-	"keep_vars": true
+	"keep_vars": true,
 	/**
      * Environment Variables (secrets)
      * Set via: wrangler secret put <KEY>
      * Required secrets: MONGO_URI, GALLERY_USER, GALLERY_PASS, JWT_SECRET, BOT_TOKEN
      * Optional secrets: TURNSTILE_SECRET_KEY, HCAPTCHA_SECRET_KEY
      */
+	"d1_databases": [
+		{
+			"binding": "DB",
+			"database_name": "gallery",
+			"database_id": "0394d7a4-769a-4856-8aa0-0143f410adb0"
+		}
+	]
 }
