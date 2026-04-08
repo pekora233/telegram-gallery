@@ -1,5 +1,5 @@
 <script setup>
-import { computed, ref, onMounted, onUnmounted, watch } from "vue";
+import { computed, ref, onMounted, onUnmounted, watch, nextTick } from "vue";
 import PhotoSwipeLightbox from "photoswipe/lightbox";
 import "photoswipe/style.css";
 
@@ -15,12 +15,17 @@ const props = defineProps({
 });
 
 const copySuccess = ref("");
+const mainImageRef = ref(null);
+const measuredDimensions = ref({});
 let lightbox = null;
 let lightboxDataSource = [];
 const PHOTOSWIPE_AUTO_LOAD_THRESHOLD = 5;
+const LIGHTBOX_DIMENSION_PREFETCH_RADIUS = 2;
 const LONG_PROMPT_MIN_LENGTH = 120;
 const LONG_PROMPT_MIN_AVG_SEGMENT = 18;
 const LONG_PROMPT_SEGMENT_LENGTH = 28;
+const pendingDimensionLoads = new Map();
+let isOpeningPhotoSwipe = false;
 
 const currentEntry = computed(() => props.entries[props.currentIndex]);
 
@@ -30,6 +35,235 @@ function getDisplayFileId(entry) {
 
 function getOriginalFormat(entry) {
   return entry?.telegram?.file_id_format || null;
+}
+
+function getDisplayFormat(entry) {
+  if (entry?.telegram?.file_id_lossy && entry?.telegram?.file_id_lossy_format) {
+    return entry.telegram.file_id_lossy_format;
+  }
+  return entry?.telegram?.file_id_format || null;
+}
+
+function getEntryImageSrc(entry) {
+  if (!entry) return "";
+  if (entry?.src) return entry.src;
+
+  const fileId = getDisplayFileId(entry);
+  if (!fileId) return "";
+
+  const fmt = getDisplayFormat(entry);
+  const filename = fmt ? `image.${fmt}` : "image";
+  return `/api/file/${encodeURIComponent(fileId)}/${filename}`;
+}
+
+function isValidImageDimension(value) {
+  return Number.isFinite(value) && value > 0;
+}
+
+function getDimensionCacheKey(entry) {
+  return String(entry?.id || getDisplayFileId(entry) || getEntryImageSrc(entry) || "");
+}
+
+function getMeasuredDimensions(entry) {
+  const key = getDimensionCacheKey(entry);
+  if (!key) return null;
+
+  const dimensions = measuredDimensions.value[key];
+  if (!isValidImageDimension(dimensions?.width) || !isValidImageDimension(dimensions?.height)) {
+    return null;
+  }
+
+  return dimensions;
+}
+
+function getMetadataDimensions(entry) {
+  const width = Number(entry?.metadata?.width);
+  const height = Number(entry?.metadata?.height);
+  if (!isValidImageDimension(width) || !isValidImageDimension(height)) {
+    return null;
+  }
+
+  return { width, height };
+}
+
+function getEntryDimensions(entry) {
+  return getMeasuredDimensions(entry) || getMetadataDimensions(entry) || null;
+}
+
+function findEntryIndex(targetEntry) {
+  if (!targetEntry) return -1;
+  return props.entries.findIndex((entry) => entry?.id === targetEntry?.id);
+}
+
+function updatePhotoSwipeSlideDimensions(index, dimensions) {
+  const pswp = lightbox?.pswp;
+  if (!pswp || !dimensions) return;
+
+  const slide = pswp.mainScroll?.itemHolders
+    ?.map((holder) => holder?.slide)
+    ?.find((candidate) => candidate?.index === index);
+
+  if (!slide) return;
+
+  const { width, height } = dimensions;
+  const previousZoom = slide.currZoomLevel;
+  const previousInitialZoom = slide.zoomLevels.initial;
+  const shouldKeepInitialZoom = Math.abs(previousZoom - previousInitialZoom) < 0.001;
+
+  slide.data.width = width;
+  slide.data.height = height;
+  slide.data.w = width;
+  slide.data.h = height;
+  slide.content.width = width;
+  slide.content.height = height;
+  slide.width = width;
+  slide.height = height;
+  slide.calculateSize();
+
+  if (slide.isActive) {
+    if (shouldKeepInitialZoom) {
+      slide.zoomAndPanToInitial();
+    } else {
+      const nextZoom = Math.min(
+        Math.max(previousZoom, slide.zoomLevels.min),
+        slide.zoomLevels.max
+      );
+      slide.setZoomLevel(nextZoom);
+      slide.pan.x = slide.bounds.correctPan("x", slide.pan.x);
+      slide.pan.y = slide.bounds.correctPan("y", slide.pan.y);
+    }
+    slide.applyCurrentZoomPan();
+  } else {
+    slide.zoomAndPanToInitial();
+    slide.applyCurrentZoomPan();
+  }
+
+  slide.updateContentSize(true);
+}
+
+function syncLightboxItemDimensions(index, dimensions) {
+  if (!Number.isFinite(index) || index < 0 || !dimensions) return;
+
+  const item = lightboxDataSource[index];
+  if (item) {
+    item.width = dimensions.width;
+    item.height = dimensions.height;
+    item.w = dimensions.width;
+    item.h = dimensions.height;
+  }
+
+  updatePhotoSwipeSlideDimensions(index, dimensions);
+}
+
+function storeMeasuredDimensions(entry, width, height) {
+  if (!entry || !isValidImageDimension(width) || !isValidImageDimension(height)) {
+    return null;
+  }
+
+  const key = getDimensionCacheKey(entry);
+  if (!key) return null;
+
+  const dimensions = {
+    width: Math.round(width),
+    height: Math.round(height)
+  };
+  const previous = measuredDimensions.value[key];
+
+  if (previous?.width === dimensions.width && previous?.height === dimensions.height) {
+    return previous;
+  }
+
+  measuredDimensions.value = {
+    ...measuredDimensions.value,
+    [key]: dimensions
+  };
+
+  const entryIndex = findEntryIndex(entry);
+  if (entryIndex >= 0) {
+    syncLightboxItemDimensions(entryIndex, dimensions);
+  }
+
+  return dimensions;
+}
+
+function captureMainImageDimensions() {
+  const entry = currentEntry.value;
+  const image = mainImageRef.value;
+  if (!entry || !image) return null;
+  if (!isValidImageDimension(image.naturalWidth) || !isValidImageDimension(image.naturalHeight)) {
+    return null;
+  }
+
+  return storeMeasuredDimensions(entry, image.naturalWidth, image.naturalHeight);
+}
+
+async function ensureEntryDimensions(entry) {
+  if (!entry) return null;
+
+  const measured = getMeasuredDimensions(entry);
+  if (measured) return measured;
+
+  const src = getEntryImageSrc(entry);
+  if (!src) return getMetadataDimensions(entry);
+
+  const key = getDimensionCacheKey(entry);
+  if (key && pendingDimensionLoads.has(key)) {
+    return pendingDimensionLoads.get(key);
+  }
+
+  const loadPromise = new Promise((resolve) => {
+    const image = new Image();
+
+    const finish = (dimensions = null) => {
+      image.onload = null;
+      image.onerror = null;
+      if (key) {
+        pendingDimensionLoads.delete(key);
+      }
+      resolve(dimensions);
+    };
+
+    image.onload = () => {
+      finish(
+        storeMeasuredDimensions(entry, image.naturalWidth, image.naturalHeight)
+        || getMetadataDimensions(entry)
+      );
+    };
+
+    image.onerror = () => {
+      finish(getMetadataDimensions(entry));
+    };
+
+    image.src = src;
+
+    if (
+      image.complete
+      && isValidImageDimension(image.naturalWidth)
+      && isValidImageDimension(image.naturalHeight)
+    ) {
+      finish(
+        storeMeasuredDimensions(entry, image.naturalWidth, image.naturalHeight)
+        || getMetadataDimensions(entry)
+      );
+    }
+  });
+
+  if (key) {
+    pendingDimensionLoads.set(key, loadPromise);
+  }
+
+  return loadPromise;
+}
+
+function prefetchNearbyDimensions(centerIndex = props.currentIndex) {
+  if (!Number.isFinite(centerIndex) || centerIndex < 0) return;
+
+  const start = Math.max(0, centerIndex - LIGHTBOX_DIMENSION_PREFETCH_RADIUS);
+  const end = Math.min(props.entries.length - 1, centerIndex + LIGHTBOX_DIMENSION_PREFETCH_RADIUS);
+
+  for (let index = start; index <= end; index += 1) {
+    void ensureEntryDimensions(props.entries[index]);
+  }
 }
 
 const canDownloadOriginal = computed(() =>
@@ -235,19 +469,13 @@ async function downloadOriginalImage() {
 }
 
 function toPhotoSwipeItem(entry) {
-  const displayFileId = getDisplayFileId(entry);
-  const fmt =
-    entry?.telegram?.file_id_lossy_format ||
-    entry?.telegram?.file_id_format ||
-    null;
-  const filename = fmt ? `image.${fmt}` : "image";
-  const fallbackSrc = displayFileId
-    ? `/api/file/${encodeURIComponent(displayFileId)}/${filename}`
-    : "";
+  const dimensions = getEntryDimensions(entry);
   return {
-    src: entry?.src || fallbackSrc,
-    width: entry?.metadata?.width || 1200,
-    height: entry?.metadata?.height || 1600,
+    src: getEntryImageSrc(entry),
+    width: dimensions?.width || 1200,
+    height: dimensions?.height || 1600,
+    w: dimensions?.width || 1200,
+    h: dimensions?.height || 1600,
     alt: entry?.prompt || ""
   };
 }
@@ -277,47 +505,70 @@ function syncPhotoSwipeDataSource() {
   }
 }
 
-function openPhotoSwipe() {
-  if (lightbox) {
-    lightbox.destroy();
-    lightbox = null;
-  }
-  lightboxDataSource = props.entries.map((entry) => toPhotoSwipeItem(entry));
+async function openPhotoSwipe() {
+  if (isOpeningPhotoSwipe) return;
+  isOpeningPhotoSwipe = true;
 
-  lightbox = new PhotoSwipeLightbox({
-    dataSource: lightboxDataSource,
-    pswpModule: () => import("photoswipe"),
-    index: props.currentIndex,
-    bgOpacity: 0.95,
-    spacing: 0.1,
-    showHideAnimationType: "fade"
-  });
+  try {
+    await ensureEntryDimensions(currentEntry.value);
+    prefetchNearbyDimensions(props.currentIndex);
 
-  lightbox.on("change", () => {
-    const newIndex = lightbox.pswp.currIndex;
-    if (newIndex !== props.currentIndex) {
-      if (typeof props.onSetIndex === "function") {
-        props.onSetIndex(newIndex);
-      } else if (newIndex > props.currentIndex) {
-        props.onNext();
-      } else {
-        props.onPrev();
-      }
-    }
-    maybeRequestMore(newIndex);
-  });
-
-  lightbox.on("close", () => {
     if (lightbox) {
       lightbox.destroy();
       lightbox = null;
     }
-    lightboxDataSource = [];
-  });
+    lightboxDataSource = props.entries.map((entry) => toPhotoSwipeItem(entry));
 
-  lightbox.init();
-  lightbox.loadAndOpen(props.currentIndex);
-  maybeRequestMore(props.currentIndex);
+    lightbox = new PhotoSwipeLightbox({
+      dataSource: lightboxDataSource,
+      pswpModule: () => import("photoswipe"),
+      index: props.currentIndex,
+      bgOpacity: 0.95,
+      spacing: 0.1,
+      showHideAnimationType: "fade"
+    });
+
+    lightbox.on("change", () => {
+      const newIndex = lightbox.pswp.currIndex;
+      if (newIndex !== props.currentIndex) {
+        if (typeof props.onSetIndex === "function") {
+          props.onSetIndex(newIndex);
+        } else if (newIndex > props.currentIndex) {
+          props.onNext();
+        } else {
+          props.onPrev();
+        }
+      }
+      void ensureEntryDimensions(props.entries[newIndex]);
+      prefetchNearbyDimensions(newIndex);
+      maybeRequestMore(newIndex);
+    });
+
+    lightbox.on("loadComplete", ({ slide, content }) => {
+      const image = content?.element;
+      if (!slide || !image || image.tagName !== "IMG") return;
+
+      storeMeasuredDimensions(
+        props.entries[slide.index],
+        image.naturalWidth,
+        image.naturalHeight
+      );
+    });
+
+    lightbox.on("close", () => {
+      if (lightbox) {
+        lightbox.destroy();
+        lightbox = null;
+      }
+      lightboxDataSource = [];
+    });
+
+    lightbox.init();
+    lightbox.loadAndOpen(props.currentIndex);
+    maybeRequestMore(props.currentIndex);
+  } finally {
+    isOpeningPhotoSwipe = false;
+  }
 }
 
 function handleKeydown(e) {
@@ -343,9 +594,22 @@ watch(
   }
 );
 
+watch(
+  () => props.currentIndex,
+  async () => {
+    await nextTick();
+    captureMainImageDimensions();
+    prefetchNearbyDimensions(props.currentIndex);
+  }
+);
+
 onMounted(() => {
   document.body.style.overflow = "hidden";
   document.addEventListener("keydown", handleKeydown);
+  void nextTick().then(() => {
+    captureMainImageDimensions();
+    prefetchNearbyDimensions(props.currentIndex);
+  });
 });
 
 onUnmounted(() => {
@@ -462,9 +726,11 @@ onUnmounted(() => {
       <div class="image-display">
         <div class="image-container" @click="openPhotoSwipe">
           <img
+            ref="mainImageRef"
             :src="currentEntry.src"
             :alt="currentEntry.prompt"
             class="main-image"
+            @load="captureMainImageDimensions"
           />
           <div class="image-overlay">
             <div class="overlay-hint">
