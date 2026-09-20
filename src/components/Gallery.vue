@@ -471,7 +471,9 @@ async function requestDeleteById(entryId) {
 
 function buildEntryWithCache(entry, existingEntry, imageCache, forceImageRefresh = false) {
   const displayFileId = getDisplayFileId(entry);
-  const cachedData = displayFileId && imageCache[displayFileId];
+  // A cached URL does not mean the image bytes are loaded. When IndexedDB is
+  // available, leave src empty so the image queue reads the saved blob first.
+  const cachedData = !useIDB && displayFileId && imageCache[displayFileId];
   const keepExistingSrc =
     Boolean(existingEntry?.src) &&
     !forceImageRefresh &&
