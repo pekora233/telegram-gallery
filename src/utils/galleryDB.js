@@ -1,7 +1,11 @@
 const DB_NAME = 'telegram-gallery';
-const DB_VERSION = 2;
+const DB_VERSION = 3;
 const STORE_NAME = 'gallery_items';
 const IMAGE_STORE_NAME = 'image_blobs';
+const IMAGE_META_STORE_NAME = 'image_cache_meta';
+const IMAGE_CACHE_MAX_BYTES = 300 * 1024 * 1024;
+const IMAGE_CACHE_SIZE_KEY = 'totalBytes';
+const IMAGE_CACHE_ORDER_KEY = 'lastInsertionOrder';
 
 let dbPromise = null;
 
@@ -17,6 +21,37 @@ function openDB() {
       }
       if (!db.objectStoreNames.contains(IMAGE_STORE_NAME)) {
         db.createObjectStore(IMAGE_STORE_NAME, { keyPath: 'fileId' });
+      }
+      if (event.oldVersion < 3) {
+        const images = request.transaction.objectStore(IMAGE_STORE_NAME);
+        images.createIndex('insertionOrder', 'insertionOrder', { unique: true });
+        const meta = db.createObjectStore(IMAGE_META_STORE_NAME);
+        const oldImages = [];
+        let totalBytes = 0;
+        const cursorRequest = images.openCursor();
+        cursorRequest.onsuccess = () => {
+          const cursor = cursorRequest.result;
+          if (cursor) {
+            const { fileId, blob, storedAt } = cursor.value;
+            const size = blob?.size || 0;
+            totalBytes += size;
+            oldImages.push({ fileId, size, storedAt: storedAt || 0, record: cursor.value });
+            cursor.continue();
+            return;
+          }
+          oldImages.sort((a, b) => a.storedAt - b.storedAt);
+          let insertionOrder = 0;
+          for (const image of oldImages) {
+            if (totalBytes > IMAGE_CACHE_MAX_BYTES) {
+              images.delete(image.fileId);
+              totalBytes -= image.size;
+            } else {
+              images.put({ ...image.record, insertionOrder: ++insertionOrder });
+            }
+          }
+          meta.put(totalBytes, IMAGE_CACHE_SIZE_KEY);
+          meta.put(insertionOrder, IMAGE_CACHE_ORDER_KEY);
+        };
       }
     };
     request.onsuccess = () => resolve(request.result);
@@ -122,13 +157,50 @@ export async function clearAll() {
 
 export async function putImageBlob(fileId, blob) {
   if (!fileId || !blob) return;
+  // A single oversized image cannot fit in the cache.
+  if (blob.size > IMAGE_CACHE_MAX_BYTES) return;
   const db = await openDB();
   return new Promise((resolve, reject) => {
-    const tx = db.transaction(IMAGE_STORE_NAME, 'readwrite');
+    const tx = db.transaction([IMAGE_STORE_NAME, IMAGE_META_STORE_NAME], 'readwrite');
     const store = tx.objectStore(IMAGE_STORE_NAME);
-    store.put({ fileId, blob, storedAt: Date.now() });
+    const meta = tx.objectStore(IMAGE_META_STORE_NAME);
+    const existingRequest = store.get(fileId);
+    const sizeRequest = meta.get(IMAGE_CACHE_SIZE_KEY);
+    const orderRequest = meta.get(IMAGE_CACHE_ORDER_KEY);
+    orderRequest.onsuccess = () => {
+      const existing = existingRequest.result;
+      let totalBytes = Math.max(0, (sizeRequest.result || 0) - (existing?.blob?.size || 0)) + blob.size;
+      const storedAt = existing?.storedAt || Date.now();
+      const insertionOrder = existing?.insertionOrder || (orderRequest.result || 0) + 1;
+
+      const save = () => {
+        store.put({ fileId, blob, storedAt, insertionOrder });
+        meta.put(totalBytes, IMAGE_CACHE_SIZE_KEY);
+        if (!existing) meta.put(insertionOrder, IMAGE_CACHE_ORDER_KEY);
+      };
+      if (totalBytes <= IMAGE_CACHE_MAX_BYTES) {
+        save();
+        return;
+      }
+
+      // The index visits the oldest images first. Keep the current image's
+      // original insertion time when replacing it.
+      const cursorRequest = store.index('insertionOrder').openCursor();
+      cursorRequest.onsuccess = () => {
+        const cursor = cursorRequest.result;
+        if (!cursor || totalBytes <= IMAGE_CACHE_MAX_BYTES) {
+          save();
+          return;
+        }
+        if (cursor.value.fileId !== fileId) {
+          totalBytes -= cursor.value.blob?.size || 0;
+          cursor.delete();
+        }
+        cursor.continue();
+      };
+    };
     tx.oncomplete = () => resolve();
-    tx.onerror = () => reject(tx.error);
+    tx.onabort = () => reject(tx.error);
   });
 }
 
@@ -151,21 +223,29 @@ export async function deleteImageBlob(fileId) {
   if (!fileId) return;
   const db = await openDB();
   return new Promise((resolve, reject) => {
-    const tx = db.transaction(IMAGE_STORE_NAME, 'readwrite');
+    const tx = db.transaction([IMAGE_STORE_NAME, IMAGE_META_STORE_NAME], 'readwrite');
     const store = tx.objectStore(IMAGE_STORE_NAME);
-    store.delete(fileId);
+    const meta = tx.objectStore(IMAGE_META_STORE_NAME);
+    const existingRequest = store.get(fileId);
+    const sizeRequest = meta.get(IMAGE_CACHE_SIZE_KEY);
+    sizeRequest.onsuccess = () => {
+      if (!existingRequest.result) return;
+      store.delete(fileId);
+      meta.put(Math.max(0, (sizeRequest.result || 0) - (existingRequest.result.blob?.size || 0)), IMAGE_CACHE_SIZE_KEY);
+    };
     tx.oncomplete = () => resolve();
-    tx.onerror = () => reject(tx.error);
+    tx.onabort = () => reject(tx.error);
   });
 }
 
 export async function clearImageBlobs() {
   const db = await openDB();
   return new Promise((resolve, reject) => {
-    const tx = db.transaction(IMAGE_STORE_NAME, 'readwrite');
-    const store = tx.objectStore(IMAGE_STORE_NAME);
-    store.clear();
+    const tx = db.transaction([IMAGE_STORE_NAME, IMAGE_META_STORE_NAME], 'readwrite');
+    tx.objectStore(IMAGE_STORE_NAME).clear();
+    tx.objectStore(IMAGE_META_STORE_NAME).put(0, IMAGE_CACHE_SIZE_KEY);
+    tx.objectStore(IMAGE_META_STORE_NAME).put(0, IMAGE_CACHE_ORDER_KEY);
     tx.oncomplete = () => resolve();
-    tx.onerror = () => reject(tx.error);
+    tx.onabort = () => reject(tx.error);
   });
 }
