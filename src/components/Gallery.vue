@@ -65,7 +65,8 @@ const DISPLAY_MODES = new Set(['desc', 'asc', 'pagination', 'categories']);
 const savedDisplayMode = localStorage.getItem('gallery_display_mode');
 const displayMode = ref(DISPLAY_MODES.has(savedDisplayMode) ? savedDisplayMode : 'desc');
 const PAGINATION_VIEW_SIZE = 60;
-const PAGINATION_PREFETCH_PAGES = 5;
+// Keep each Worker response small enough for the Free plan CPU budget.
+const PAGINATION_PREFETCH_PAGES = 1;
 const POLL_INTERVAL_MS = 3 * 60 * 1000;
 const POLL_LATEST_LIMIT = 30;
 const PAGINATION_PAGE_KEY = 'gallery_pagination_page';
@@ -677,7 +678,7 @@ async function prefetchPaginationAhead(currentPage = paginationPage.value) {
   const totalPages = Math.max(1, Math.trunc(Number(paginationTotalPages.value) || 1));
   const page = Math.max(1, Math.min(Math.trunc(Number(currentPage) || 1), totalPages));
   const batchStart = getPaginationBatchStart(page, PAGINATION_PREFETCH_PAGES);
-  const prefetchThreshold = batchStart + Math.floor(PAGINATION_PREFETCH_PAGES / 2) - 1;
+  const prefetchThreshold = batchStart + Math.floor(PAGINATION_PREFETCH_PAGES / 2);
   if (page < prefetchThreshold) return;
 
   const nextBatchStart = batchStart + PAGINATION_PREFETCH_PAGES;

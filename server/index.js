@@ -423,7 +423,9 @@ async function lookupFileMetaFromDb(env, fileId) {
 const MONGO_CONNECT_TIMEOUT_MS = 5000;
 const MONGO_SOCKET_TIMEOUT_MS = 10000;
 const MONGO_SERVER_SELECTION_TIMEOUT_MS = 5000;
-const GALLERY_MAX_PAGE_SPAN = 6;
+// Limit old clients as well: mapping and serializing 5 pages can exceed the
+// Workers Free plan's 10 ms CPU allowance.
+const GALLERY_MAX_PAGE_SPAN = 1;
 const GALLERY_COUNT_CACHE_TTL_MS = 30 * 1000;
 let galleryCountCacheValue = null;
 let galleryCountCacheExpiresAt = 0;
