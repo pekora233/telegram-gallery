@@ -46,10 +46,13 @@ npm run build
 Open an image and select the book icon in the detail toolbar to enter manga mode, powered by `@tokagemushi/manga-viewer`. It follows the current gallery order and starts at the selected image. Choose ascending order in the gallery first if the pages should run oldest to newest.
 
 - Switch between right-to-left and left-to-right reading, or paged and vertical-scroll modes. These preferences are saved locally.
+- Reading-direction controls only appear in paged mode. Vertical scrolling always follows the top-to-bottom page order, while preserving the direction preference for returning to paged mode.
 - Images reuse the gallery's existing Blob URLs or read from the shared IndexedDB image cache before falling back to the remote file API. Switching modes or reopening cached images does not download them again.
 - Landscape screens automatically show spreads. Swipe, use arrow keys or Space, double-click/pinch to zoom, and use the bottom slider to jump to a page.
 - More images load near the end of the list when the gallery supports infinite loading. Numbered pagination reads the currently loaded gallery page only.
 - Return or press Escape to go back to image details at the current reading position. The existing PhotoSwipe viewer remains available.
+- Immersive fullscreen removes toolbar space and hides the toolbar, progress slider, and zoom controls. Tap the center to reveal/hide menus, or press Tab to reveal keyboard controls. Escape exits fullscreen before closing the reader.
+- On touch screens, native fullscreen locks the orientation captured before entry and releases that lock on exit. If fullscreen or orientation locking is unavailable, page-level immersion is used without forcing rotation; browser/system bars may remain visible in this fallback.
 
 ### Browser Tests
 

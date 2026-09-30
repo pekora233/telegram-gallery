@@ -77,6 +77,13 @@ async function openReader(page, pageNumber = 1) {
 
 const pageCount = (reader) => reader.locator(".mv-footer-info span").first();
 
+async function revealReaderControls(reader) {
+  const main = reader.locator(".mv-main");
+  const bounds = await main.boundingBox();
+  await main.click({ position: { x: bounds.width / 2, y: bounds.height / 2 } });
+  await expect(reader.locator(".reader-toolbar")).toBeVisible();
+}
+
 async function captureReader(page, reader, path) {
   await expect(reader.locator(".mv-loading-screen")).toHaveCSS("opacity", "0");
   await expect.poll(() => reader.locator(".mv-page-slot img").evaluateAll((images) => {
@@ -125,8 +132,11 @@ test.describe("portrait reader", () => {
     await expect(pageCount(reader)).toHaveText("5 / 12");
     await reader.getByLabel("阅读模式").selectOption("scroll");
     await expect(reader.locator(".mv-scroll-mode")).toBeVisible();
+    await expect(reader.getByLabel("阅读方向")).toHaveCount(0);
+    await expect(reader.getByRole("option", { name: "从右向左" })).toHaveCount(0);
     await expect(pageCount(reader)).toHaveText("5 / 12");
     await reader.getByLabel("阅读模式").selectOption("page");
+    await expect(reader.getByLabel("阅读方向")).toHaveValue("ltr");
     await expect(pageCount(reader)).toHaveText("5 / 12");
     const toolbar = await reader.locator(".reader-toolbar").boundingBox();
     expect(toolbar.width).toBeLessThanOrEqual(390);
@@ -223,15 +233,141 @@ test("unavailable images show a recoverable empty state", async ({ page }) => {
   expect(errors).toEqual([]);
 });
 
-test("fullscreen exits when closing the reader", async ({ page }) => {
+test("immersive fullscreen hides reader chrome and exits when closing", async ({ page }) => {
+  await page.addInitScript(() => {
+    const originalRequest = Element.prototype.requestFullscreen;
+    Element.prototype.requestFullscreen = function (options) {
+      window.fullscreenRequestOptions = options;
+      return originalRequest.call(this, options);
+    };
+  });
   const { errors } = await setupGallery(page);
   const reader = await openReader(page);
   await reader.getByRole("button", { name: "全屏阅读" }).click();
+  await expect(reader).toHaveClass(/is-immersive/);
+  await expect(reader.locator(".reader-toolbar")).toBeHidden();
+  await expect(reader.locator(".mv-footer")).toBeHidden();
+  const bounds = await reader.locator(".mv-container").boundingBox();
+  expect(bounds.y).toBe(0);
+  expect(bounds.height).toBe(await page.evaluate(() => innerHeight));
+  expect(await page.evaluate(() => window.fullscreenRequestOptions)).toEqual({ navigationUI: "hide" });
+  await revealReaderControls(reader);
   await expect(reader.getByRole("button", { name: "退出全屏" })).toBeVisible();
+  await reader.getByRole("button", { name: "退出全屏" }).click();
+  await expect(reader).not.toHaveClass(/is-immersive/);
+  await expect(reader.locator(".reader-toolbar")).toBeVisible();
+  await expect(reader.locator(".mv-footer")).toBeVisible();
+  await reader.getByRole("button", { name: "全屏阅读" }).click();
+  await expect(reader.locator(".reader-toolbar")).toBeHidden();
+  await revealReaderControls(reader);
   await reader.getByRole("button", { name: "返回图片详情" }).click();
   await expect(reader).toHaveCount(0);
   await expect.poll(() => page.evaluate(() => document.fullscreenElement === null)).toBe(true);
   expect(errors).toEqual([]);
+});
+
+test.describe("phone immersive mode", () => {
+  test.use({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true });
+
+  async function configureOrientation(page, { rejectLock = false, disableFullscreen = false, disableOrientation = false } = {}) {
+    await page.addInitScript(({ reject, disable, missingOrientation }) => {
+      window.orientationLocks = [];
+      window.orientationUnlocks = 0;
+      Object.defineProperty(screen.orientation, "type", { configurable: true, get: () => "portrait-primary" });
+      screen.orientation.lock = async (orientation) => {
+        window.orientationLocks.push(orientation);
+        if (reject) throw new DOMException("Orientation unavailable", "NotSupportedError");
+      };
+      screen.orientation.unlock = () => { window.orientationUnlocks += 1; };
+      if (missingOrientation) screen.orientation.lock = undefined;
+      if (disable) Element.prototype.requestFullscreen = undefined;
+    }, { reject: rejectLock, disable: disableFullscreen, missingOrientation: disableOrientation });
+  }
+
+  test("native fullscreen keeps portrait and releases its orientation lock on exit", async ({ page }, testInfo) => {
+    await configureOrientation(page);
+    const { errors } = await setupGallery(page);
+    const reader = await openReader(page, 3);
+    await reader.getByRole("button", { name: "全屏阅读" }).click();
+    await expect(reader).toHaveClass(/controls-hidden/);
+    await expect.poll(() => page.evaluate(() => window.orientationLocks)).toEqual(["portrait-primary"]);
+    await expect.poll(() => page.evaluate(() => document.fullscreenElement?.classList.contains("manga-reader"))).toBe(true);
+    await expect(pageCount(reader)).toHaveText("3 / 12");
+    const bounds = await reader.locator(".mv-container").boundingBox();
+    expect(bounds.y).toBe(0);
+    expect(bounds.height).toBeGreaterThan(bounds.width);
+    await captureReader(page, reader, testInfo.outputPath("portrait-immersive.png"));
+    await page.evaluate(() => document.exitFullscreen());
+    await expect(reader).not.toHaveClass(/is-immersive/);
+    await expect(reader.locator(".reader-toolbar")).toBeVisible();
+    expect(await page.evaluate(() => window.orientationUnlocks)).toBe(1);
+    await reader.getByRole("button", { name: "返回图片详情" }).click();
+    expect(await page.evaluate(() => window.orientationUnlocks)).toBe(1);
+    expect(errors).toEqual([]);
+  });
+
+  test("closing native fullscreen releases the lock and fullscreen element", async ({ page }) => {
+    await configureOrientation(page);
+    const { errors } = await setupGallery(page);
+    const reader = await openReader(page);
+    await reader.getByRole("button", { name: "全屏阅读" }).click();
+    await expect.poll(() => page.evaluate(() => window.orientationLocks.length)).toBe(1);
+    await page.touchscreen.tap(195, 420);
+    await expect(reader.locator(".reader-toolbar")).toBeVisible();
+    await reader.getByRole("button", { name: "返回图片详情" }).click();
+    await expect.poll(() => page.evaluate(() => document.fullscreenElement === null)).toBe(true);
+    expect(await page.evaluate(() => window.orientationUnlocks)).toBe(1);
+    expect(errors).toEqual([]);
+  });
+
+  for (const options of [{ rejectLock: true }, { disableFullscreen: true }, { disableOrientation: true }]) {
+    const reason = options.rejectLock ? "orientation lock is rejected" : options.disableFullscreen ? "native fullscreen is unavailable" : "orientation API is unavailable";
+    test(`falls back to portrait immersion when ${reason}`, async ({ page }) => {
+      await configureOrientation(page, options);
+      const { errors } = await setupGallery(page);
+      const reader = await openReader(page, 3);
+      await reader.getByRole("button", { name: "全屏阅读" }).click();
+      await expect(reader).toHaveClass(/controls-hidden/);
+      await expect.poll(() => page.evaluate(() => document.fullscreenElement === null)).toBe(true);
+      const bounds = await reader.locator(".mv-container").boundingBox();
+      expect(bounds.y).toBe(0);
+      expect(bounds.height).toBe(844);
+      await expect(pageCount(reader)).toHaveText("3 / 12");
+      await page.keyboard.press("Tab");
+      await expect(reader.locator(".reader-toolbar")).toBeVisible();
+      await expect(reader.locator(".reader-heading")).toContainText("浏览器栏可能仍然显示");
+      await reader.getByRole("button", { name: "退出全屏" }).click();
+      await expect(reader).not.toHaveClass(/is-immersive/);
+      await expect(reader.locator(".reader-toolbar")).toBeVisible();
+      expect(await page.evaluate(() => window.orientationUnlocks)).toBe(0);
+      expect(errors).toEqual([]);
+    });
+  }
+
+  test("scroll mode hides direction controls and taps toggle immersive menus", async ({ page }) => {
+    await configureOrientation(page, { disableFullscreen: true });
+    const { errors } = await setupGallery(page);
+    const reader = await openReader(page);
+    await reader.getByLabel("阅读方向").selectOption("rtl");
+    await reader.getByLabel("阅读模式").selectOption("scroll");
+    await expect(reader.getByLabel("阅读方向")).toHaveCount(0);
+    await expect(reader.getByRole("slider", { name: "阅读进度" })).not.toHaveClass(/mv-rtl-slider/);
+    await expect(reader.locator(".mv-loading-screen")).toHaveCSS("opacity", "0");
+    await reader.getByRole("button", { name: "全屏阅读" }).click();
+    await expect(reader.locator(".reader-toolbar")).toBeHidden();
+    await page.touchscreen.tap(195, 420);
+    await expect(reader.locator(".reader-toolbar")).toBeVisible();
+    await expect(reader.getByLabel("阅读方向")).toHaveCount(0);
+    await page.touchscreen.tap(195, 420);
+    await expect(reader.locator(".reader-toolbar")).toBeHidden();
+    await expect(reader.locator(".mv-footer")).toBeHidden();
+    await page.keyboard.press("Escape");
+    await expect(reader).not.toHaveClass(/is-immersive/);
+    await expect(reader).toBeVisible();
+    await reader.getByLabel("阅读模式").selectOption("page");
+    await expect(reader.getByLabel("阅读方向")).toHaveValue("rtl");
+    expect(errors).toEqual([]);
+  });
 });
 
 test.describe("local image cache", () => {
@@ -338,6 +474,29 @@ test.describe("touch scrolling", () => {
     await session.send("Input.dispatchTouchEvent", { type: "touchEnd", touchPoints: [] });
     return waitForScrollIdle(main);
   }
+
+  test("immersive vertical swipes scroll without accidentally revealing menus", async ({ page }) => {
+    await page.addInitScript(() => { Element.prototype.requestFullscreen = undefined; });
+    const { errors } = await setupGallery(page);
+    const reader = await openReader(page);
+    await reader.getByLabel("阅读模式").selectOption("scroll");
+    await expect(reader.locator(".mv-loading-screen")).toHaveCSS("opacity", "0");
+    await reader.getByRole("button", { name: "全屏阅读" }).click();
+    await expect(reader.locator(".reader-toolbar")).toBeHidden();
+    const session = await page.context().newCDPSession(page);
+    try {
+      const main = reader.locator(".mv-main");
+      const afterFirstSwipe = await swipeUp(page, session, main, 0.5);
+      const afterSecondSwipe = await swipeUp(page, session, main, 0.5);
+      expect(afterFirstSwipe).toBeGreaterThan(100);
+      expect(afterSecondSwipe).toBeGreaterThan(afterFirstSwipe + 100);
+      await expect(reader.locator(".reader-toolbar")).toBeHidden();
+      await expect(reader.locator(".mv-footer")).toBeHidden();
+      expect(errors).toEqual([]);
+    } finally {
+      await session.detach();
+    }
+  });
 
   for (const [position, horizontalPosition] of [["center", 0.5], ["left", 0.15], ["right", 0.85]]) {
     test(`repeated vertical swipes keep scrolling over the ${position} of the image`, async ({ page }) => {
