@@ -59,3 +59,5 @@ npm test
 ```
 
 Tests use mocked gallery and image APIs; no production database or Telegram requests are made. Set `PLAYWRIGHT_CHANNEL=msedge` to use an installed Microsoft Edge instead of bundled Chromium.
+
+Touch regressions use real Chromium touch input and verify repeated vertical swipes over the center and both edges of an image, not just programmatic scroll-position changes.

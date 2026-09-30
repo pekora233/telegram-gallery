@@ -303,3 +303,62 @@ test.describe("local image cache", () => {
     expect(imageRequests.every((source) => source.endsWith("/api/file/original-3/image.png"))).toBe(true);
   });
 });
+
+test.describe("touch scrolling", () => {
+  test.use({ viewport: { width: 390, height: 844 }, hasTouch: true, isMobile: true });
+
+  async function waitForScrollIdle(main) {
+    let previous = -1;
+    let stableSamples = 0;
+    await expect.poll(async () => {
+      const current = await main.evaluate((element) => element.scrollTop);
+      stableSamples = Math.abs(current - previous) < 1 ? stableSamples + 1 : 0;
+      previous = current;
+      return stableSamples;
+    }, { intervals: [50], timeout: 5000 }).toBeGreaterThanOrEqual(4);
+    return previous;
+  }
+
+  async function swipeUp(page, session, main, horizontalPosition) {
+    const bounds = await main.boundingBox();
+    const positionX = bounds.x + bounds.width * horizontalPosition;
+    const startY = bounds.y + bounds.height * 0.8;
+    const endY = bounds.y + bounds.height * 0.3;
+    await session.send("Input.dispatchTouchEvent", {
+      type: "touchStart",
+      touchPoints: [{ x: positionX, y: startY }]
+    });
+    for (let step = 1; step <= 24; step += 1) {
+      await session.send("Input.dispatchTouchEvent", {
+        type: "touchMove",
+        touchPoints: [{ x: positionX, y: startY + (endY - startY) * step / 24 }]
+      });
+      await page.evaluate(() => new Promise(requestAnimationFrame));
+    }
+    await session.send("Input.dispatchTouchEvent", { type: "touchEnd", touchPoints: [] });
+    return waitForScrollIdle(main);
+  }
+
+  for (const [position, horizontalPosition] of [["center", 0.5], ["left", 0.15], ["right", 0.85]]) {
+    test(`repeated vertical swipes keep scrolling over the ${position} of the image`, async ({ page }) => {
+      const { errors } = await setupGallery(page);
+      const reader = await openReader(page);
+      await reader.getByLabel("阅读模式").selectOption("scroll");
+      await expect(reader.locator(".mv-scroll-mode")).toBeVisible();
+      await expect(reader.locator(".mv-loading-screen")).toHaveCSS("opacity", "0");
+      const main = reader.locator(".mv-main");
+      const session = await page.context().newCDPSession(page);
+      try {
+        const afterFirstSwipe = await swipeUp(page, session, main, horizontalPosition);
+        expect(afterFirstSwipe).toBeGreaterThan(100);
+        const afterSecondSwipe = await swipeUp(page, session, main, horizontalPosition);
+        expect(afterSecondSwipe, `second swipe after scrolling to ${afterFirstSwipe}px`).toBeGreaterThan(afterFirstSwipe + 100);
+        const afterThirdSwipe = await swipeUp(page, session, main, horizontalPosition);
+        expect(afterThirdSwipe).toBeGreaterThan(afterSecondSwipe + 100);
+        expect(errors).toEqual([]);
+      } finally {
+        await session.detach();
+      }
+    });
+  }
+});

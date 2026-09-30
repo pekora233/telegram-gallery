@@ -142,7 +142,11 @@ async function rebuildViewer() {
       onPageChange: notifyPageChange
     });
     const style = document.createElement("style");
-    style.textContent = ".mv-container { position: absolute; height: 100%; }";
+    style.textContent = `
+      .mv-container { position: absolute; height: 100%; }
+      .mv-scroll-mode, .mv-scroll-mode .mv-zoom-container { touch-action: pan-y pinch-zoom; }
+      .mv-scroll-mode .mv-tap-area { display: none; }
+    `;
     viewerHost.value.shadowRoot.appendChild(style);
     const pagesBySource = new Map(currentPages.map((page, index) => [imageSources[index], page]));
     viewerHost.value.shadowRoot.querySelectorAll(".mv-page-slot img").forEach((image) => {
