@@ -40,3 +40,21 @@ npm run dev
 ```sh
 npm run build
 ```
+
+## Manga Reader
+
+Open an image and select the book icon in the detail toolbar to enter manga mode, powered by `@tokagemushi/manga-viewer`. It follows the current gallery order and starts at the selected image. Choose ascending order in the gallery first if the pages should run oldest to newest.
+
+- Switch between right-to-left and left-to-right reading, or paged and vertical-scroll modes. These preferences are saved locally.
+- Landscape screens automatically show spreads. Swipe, use arrow keys or Space, double-click/pinch to zoom, and use the bottom slider to jump to a page.
+- More images load near the end of the list when the gallery supports infinite loading. Numbered pagination reads the currently loaded gallery page only.
+- Return or press Escape to go back to image details at the current reading position. The existing PhotoSwipe viewer remains available.
+
+### Browser Tests
+
+```sh
+npx playwright install chromium
+npm test
+```
+
+Tests use mocked gallery and image APIs; no production database or Telegram requests are made. Set `PLAYWRIGHT_CHANNEL=msedge` to use an installed Microsoft Edge instead of bundled Chromium.

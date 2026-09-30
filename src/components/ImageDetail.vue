@@ -1,7 +1,9 @@
 <script setup>
-import { computed, ref, onMounted, onUnmounted, watch, nextTick } from "vue";
+import { computed, ref, onMounted, onUnmounted, watch, nextTick, defineAsyncComponent } from "vue";
 import PhotoSwipeLightbox from "photoswipe/lightbox";
 import "photoswipe/style.css";
+
+const MangaReader = defineAsyncComponent(() => import("./MangaReader.vue"));
 
 const props = defineProps({
   entries: Array,
@@ -15,6 +17,7 @@ const props = defineProps({
 });
 
 const copySuccess = ref("");
+const showMangaReader = ref(false);
 const mainImageRef = ref(null);
 const measuredDimensions = ref({});
 let lightbox = null;
@@ -572,6 +575,7 @@ async function openPhotoSwipe() {
 }
 
 function handleKeydown(e) {
+  if (showMangaReader.value) return;
   if (lightbox && lightbox.pswp) return;
 
   if (e.key === "ArrowLeft" && props.onPrev) {
@@ -686,6 +690,16 @@ onUnmounted(() => {
       </div>
 
       <div class="navbar-right">
+        <button
+          @click="showMangaReader = true"
+          class="nav-icon-btn"
+          title="漫画阅读"
+          aria-label="漫画阅读"
+        >
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M12 7v14m0-14C9 5 5 5 2 6v14c3-1 7-1 10 1 3-2 7-2 10-1V6c-3-1-7-1-10 1Z" />
+          </svg>
+        </button>
         <button @click="openPhotoSwipe" class="nav-icon-btn" title="全屏查看">
           <svg
             width="20"
@@ -1004,6 +1018,14 @@ onUnmounted(() => {
       </div>
     </div>
   </div>
+  <MangaReader
+    v-if="showMangaReader"
+    :entries="props.entries"
+    :current-index="props.currentIndex"
+    :on-set-index="props.onSetIndex"
+    :on-need-more="props.onNeedMore"
+    @close="showMangaReader = false"
+  />
 </template>
 
 <style scoped>
