@@ -1,6 +1,7 @@
 <script setup>
 import { computed, inject, onMounted, onUnmounted, ref, watch } from "vue";
 import MangaViewer from "@tokagemushi/manga-viewer";
+import { getImageBlob } from "../utils/galleryDB.js";
 
 const props = defineProps({
   entries: { type: Array, default: () => [] },
@@ -21,6 +22,10 @@ let viewer = null;
 let rebuilding = false;
 let activeEntryId = null;
 let fullscreenRoot = null;
+let renderGeneration = 0;
+let disposed = false;
+const imageSourceLoads = new Map();
+const ownedImageUrls = new Set();
 
 function readPreference(key, allowed, fallback) {
   try {
@@ -39,11 +44,14 @@ const pages = computed(() => props.entries.flatMap((entry, entryIndex) => {
     ? entry.telegram.file_id_lossy_format
     : entry?.telegram?.file_id_format;
   const filename = format ? `image.${format}` : "image";
-  const src = fileId ? `/api/file/${encodeURIComponent(fileId)}/${filename}` : entry?.src;
+  const reusableSource = /^(blob:|data:)/.test(entry?.src || "")
+    && (!entry.displayFileId || entry.displayFileId === fileId);
+  const src = reusableSource ? entry.src : fileId ? `/api/file/${encodeURIComponent(fileId)}/${filename}` : entry?.src;
   const width = Number(entry?.metadata?.width);
   const height = Number(entry?.metadata?.height);
   return src ? [{
     id: entry.id,
+    fileId,
     entryIndex,
     src,
     width: Number.isFinite(width) && width > 0 ? width : 1200,
@@ -76,8 +84,32 @@ function notifyPageChange(pageNumber) {
   }
 }
 
-function rebuildViewer() {
+function resolveImageSource(page) {
+  if (!page.fileId || /^(blob:|data:)/.test(page.src)) return Promise.resolve(page.src);
+  if (imageSourceLoads.has(page.fileId)) return imageSourceLoads.get(page.fileId);
+
+  const sourceLoad = (async () => {
+    try {
+      const blob = await getImageBlob(page.fileId);
+      if (blob && !disposed) {
+        const source = URL.createObjectURL(blob);
+        ownedImageUrls.add(source);
+        return source;
+      }
+    } catch {}
+    imageSourceLoads.delete(page.fileId);
+    return page.src;
+  })();
+  imageSourceLoads.set(page.fileId, sourceLoad);
+  return sourceLoad;
+}
+
+async function rebuildViewer() {
   if (!viewerHost.value) return;
+  const generation = ++renderGeneration;
+  const currentPages = pages.value;
+  const imageSources = await Promise.all(currentPages.map(resolveImageSource));
+  if (disposed || generation !== renderGeneration || currentPages !== pages.value || !viewerHost.value) return;
   const previousPage = viewer?.currentPage || 1;
   rebuilding = true;
   viewer?.destroy();
@@ -98,7 +130,7 @@ function rebuildViewer() {
   try {
     viewer = new MangaViewer({
       container: viewerHost.value,
-      pages: pages.value.map((page) => page.src),
+      pages: imageSources,
       direction: direction.value,
       viewMode: viewMode.value,
       theme: theme.value,
@@ -112,7 +144,7 @@ function rebuildViewer() {
     const style = document.createElement("style");
     style.textContent = ".mv-container { position: absolute; height: 100%; }";
     viewerHost.value.shadowRoot.appendChild(style);
-    const pagesBySource = new Map(pages.value.map((page) => [page.src, page]));
+    const pagesBySource = new Map(currentPages.map((page, index) => [imageSources[index], page]));
     viewerHost.value.shadowRoot.querySelectorAll(".mv-page-slot img").forEach((image) => {
       const page = pagesBySource.get(image.getAttribute("src"));
       if (!page) return;
@@ -187,10 +219,14 @@ onMounted(() => {
 });
 
 onUnmounted(() => {
+  disposed = true;
+  renderGeneration += 1;
   if (document.fullscreenElement === fullscreenRoot) {
     void document.exitFullscreen().catch(() => {});
   }
   viewer?.destroy();
+  ownedImageUrls.forEach((source) => URL.revokeObjectURL(source));
+  ownedImageUrls.clear();
   clearSessionProgress();
   document.removeEventListener("fullscreenchange", updateFullscreen);
   previousFocus?.focus({ preventScroll: true });

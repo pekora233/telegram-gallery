@@ -157,7 +157,7 @@ test.describe("portrait reader", () => {
     const { errors } = await setupGallery(page, { missingImage: true });
     const reader = await openReader(page);
     await expect(pageCount(reader)).toHaveText("1 / 11");
-    await expect(reader.locator('img[src="/api/file/lossy%20%2F1/image.webp"]').first()).toBeAttached();
+    await expect(reader.locator('.mv-page-slot[data-slot="0"] img').first()).toHaveAttribute("src", /^blob:/);
     await reader.locator(".reader-host").press("ArrowLeft");
     await expect(pageCount(reader)).toHaveText("2 / 11");
     await reader.getByRole("button", { name: "返回图片详情" }).click();
@@ -232,4 +232,74 @@ test("fullscreen exits when closing the reader", async ({ page }) => {
   await expect(reader).toHaveCount(0);
   await expect.poll(() => page.evaluate(() => document.fullscreenElement === null)).toBe(true);
   expect(errors).toEqual([]);
+});
+
+test.describe("local image cache", () => {
+  test.use({ viewport: { width: 390, height: 844 } });
+
+  async function openCacheFixture(page, options) {
+    const imageRequests = [];
+    await page.addInitScript((configuration) => {
+      window.readerFixture = configuration;
+      if (configuration.disableDatabase) {
+        Object.defineProperty(window, "indexedDB", { value: undefined });
+      }
+    }, { entries: makeEntries(3), ...options });
+    await page.route("**/api/file/**", async (route) => {
+      imageRequests.push(route.request().url());
+      await route.fulfill({
+        contentType: "image/svg+xml",
+        body: '<svg xmlns="http://www.w3.org/2000/svg" width="600" height="900"><rect width="600" height="900" fill="#94b2d8"/></svg>'
+      });
+    });
+    await page.goto("/tests/fixtures/manga-reader.html");
+    const reader = page.getByRole("dialog", { name: "漫画阅读" });
+    await expect(reader.getByRole("slider", { name: "阅读进度" })).toBeVisible();
+    return { reader, imageRequests };
+  }
+
+  test("reads IndexedDB without file requests and reopens offline", async ({ page }) => {
+    const { reader, imageRequests } = await openCacheFixture(page, { seedCache: true });
+    await expect(reader.locator('.mv-page-slot[data-slot="0"] img')).toHaveAttribute("src", /^blob:/);
+    await expect.poll(() => reader.locator('.mv-page-slot[data-slot="0"] img').evaluate((image) => image.complete && image.naturalWidth > 0)).toBe(true);
+    await page.context().setOffline(true);
+    await reader.getByLabel("阅读方向").selectOption("ltr");
+    await reader.getByLabel("阅读模式").selectOption("scroll");
+    await expect(pageCount(reader)).toHaveText("1 / 3");
+    await reader.getByRole("button", { name: "返回图片详情" }).click();
+    expect(await page.evaluate(() => window.revokedImageUrls.length)).toBe(3);
+    await page.getByRole("button", { name: "重新打开" }).click();
+    await expect(reader.getByRole("slider", { name: "阅读进度" })).toBeVisible();
+    await expect(reader.locator('.mv-page-slot[data-slot="0"] img')).toHaveAttribute("src", /^blob:/);
+    await expect.poll(() => reader.locator('.mv-page-slot[data-slot="0"] img').evaluate((image) => image.complete && image.naturalWidth > 0)).toBe(true);
+    expect(imageRequests).toEqual([]);
+  });
+
+  test("reuses gallery Blob URLs even when IndexedDB is unavailable", async ({ page }) => {
+    const { reader, imageRequests } = await openCacheFixture(page, { reuseBlobs: true, disableDatabase: true });
+    await expect(reader.locator('.mv-page-slot[data-slot="0"] img')).toHaveAttribute("src", /^blob:/);
+    await reader.getByLabel("阅读方向").selectOption("ltr");
+    await reader.getByRole("button", { name: "返回图片详情" }).click();
+    expect(await page.evaluate(() => window.revokedImageUrls)).toEqual([]);
+    await page.getByRole("button", { name: "重新打开" }).click();
+    await expect(reader.getByRole("slider", { name: "阅读进度" })).toBeVisible();
+    await expect.poll(() => reader.locator('.mv-page-slot[data-slot="0"] img').evaluate((image) => image.complete && image.naturalWidth > 0)).toBe(true);
+    expect(imageRequests).toEqual([]);
+  });
+
+  test("only missing images fall back to the file API", async ({ page }) => {
+    const { reader, imageRequests } = await openCacheFixture(page, {});
+    await expect(reader.locator('.mv-page-slot[data-slot="0"] img')).toHaveAttribute("src", "/api/file/lossy%20%2F1/image.webp");
+    await expect.poll(() => imageRequests.length).toBe(3);
+    await expect.poll(() => reader.locator('.mv-page-slot[data-slot="0"] img').evaluate((image) => image.complete && image.naturalWidth > 0)).toBe(true);
+  });
+
+  test("mixed cache hits request only the uncached file", async ({ page }) => {
+    const { reader, imageRequests } = await openCacheFixture(page, { seedCache: true, seedCacheCount: 2 });
+    await expect(reader.locator('.mv-page-slot[data-slot="0"] img')).toHaveAttribute("src", /^blob:/);
+    await expect(reader.locator('.mv-page-slot[data-slot="1"] img')).toHaveAttribute("src", /^blob:/);
+    await expect(reader.locator('.mv-page-slot[data-slot="2"] img')).toHaveAttribute("src", "/api/file/original-3/image.png");
+    await expect.poll(() => imageRequests.length).toBeGreaterThan(0);
+    expect(imageRequests.every((source) => source.endsWith("/api/file/original-3/image.png"))).toBe(true);
+  });
 });
